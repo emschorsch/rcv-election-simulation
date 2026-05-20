@@ -11,6 +11,7 @@ from primary_scraper import (
     _parse_openelections_df,
     _wide_columns_to_tidy,
     add_percentages,
+    filter_min_winner_votes,
     filter_non_majority,
     filter_race_names,
     format_for_sheet,
@@ -179,6 +180,47 @@ def test_filter_non_majority_custom_threshold():
     assert len(filter_non_majority(df, threshold=40.0)) == 0
     assert len(filter_non_majority(df, threshold=45.0)) == 3  # boundary kept
     assert len(filter_non_majority(df, threshold=50.0)) == 3
+
+
+# --- filter_min_winner_votes -----------------------------------------------
+
+def test_filter_min_winner_votes_keeps_race_with_large_winner():
+    df = pd.DataFrame({
+        "Candidate": ["A", "B"], "Race_Name": ["X", "X"], "Votes": [500, 400],
+    })
+    assert len(filter_min_winner_votes(df, min_votes=100)) == 2
+
+
+def test_filter_min_winner_votes_drops_race_with_tiny_winner():
+    df = pd.DataFrame({
+        "Candidate": ["A", "B"], "Race_Name": ["X", "X"], "Votes": [40, 30],
+    })
+    assert len(filter_min_winner_votes(df, min_votes=100)) == 0
+
+
+def test_filter_min_winner_votes_drops_only_tiny_races_when_mixed():
+    df = pd.DataFrame({
+        "Candidate": ["A", "B", "C", "D"],
+        "Race_Name": ["BigRace", "BigRace", "TinyRace", "TinyRace"],
+        "Votes": [500, 400, 40, 30],
+    })
+    out = filter_min_winner_votes(df, min_votes=100)
+    assert set(out['Race_Name']) == {"BigRace"}
+
+
+def test_filter_min_winner_votes_uses_max_not_total():
+    # Two candidates at 60 each: total 120 but max is 60 — drop with min=100.
+    df = pd.DataFrame({
+        "Candidate": ["A", "B"], "Race_Name": ["X", "X"], "Votes": [60, 60],
+    })
+    assert len(filter_min_winner_votes(df, min_votes=100)) == 0
+
+
+def test_filter_min_winner_votes_at_exact_threshold_kept():
+    df = pd.DataFrame({
+        "Candidate": ["A", "B"], "Race_Name": ["X", "X"], "Votes": [100, 50],
+    })
+    assert len(filter_min_winner_votes(df, min_votes=100)) == 2
 
 
 # --- filter_race_names ------------------------------------------------------
