@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Optional
 
 import pandas as pd
@@ -173,24 +174,86 @@ _NON_CANDIDATE_NAMES = frozenset({
 })
 
 
+def _strip_middle_initials(name: str) -> str:
+    """Drop single-letter middle tokens. `RYAN E MACKENZIE` → `RYAN MACKENZIE`;
+    `CHRISTINA M HARTMAN` → `CHRISTINA HARTMAN`. Leaves the first and last
+    tokens alone (so `R KELLY` stays — first token is preserved)."""
+    parts = name.split()
+    if len(parts) <= 2:
+        return name
+    middle = [p for p in parts[1:-1] if len(p) > 1]
+    return ' '.join([parts[0]] + middle + [parts[-1]])
+
+
 def _normalize_candidate(s: pd.Series) -> pd.Series:
     """Canonicalize candidate names so cross-county variants collapse to one row.
-    Upper-cases, strips periods (`L. WEISS` → `L WEISS`), collapses whitespace,
-    and removes a trailing party code (`DAVE SUNDAY REP` → `DAVE SUNDAY`).
 
-    Does NOT attempt to merge gov/lt-gov ticket variants like
-    `SHAPIRO / DAVIS` vs `JOSH SHAPIRO` vs `JOSH SHAPIRO AUSTIN DAVIS`. Those
+    Steps, in order: upper-case, strip periods/commas/apostrophes, collapse
+    whitespace, drop a trailing party code (`DAVE SUNDAY REP` → `DAVE SUNDAY`),
+    and drop single-letter middle tokens (`RYAN E MACKENZIE` → `RYAN MACKENZIE`).
+
+    Does NOT attempt to merge gov/president ticket variants like
+    `SHAPIRO / DAVIS` vs `JOSH SHAPIRO` vs `JOSH SHAPIRO AUSTIN DAVIS` — those
     would require an external roster and are flagged as a known limitation.
     """
     out = (
         s.fillna('').astype(str)
         .str.upper()
-        .str.replace('.', '', regex=False)
+        .str.replace(r"[.,']", '', regex=True)
         .str.replace(r'\s+', ' ', regex=True)
         .str.strip()
     )
     out = out.str.replace(_PARTY_SUFFIX_RE, '', regex=True).str.strip()
+    out = out.map(_strip_middle_initials)
     return out
+
+
+def fuzzy_canonicalize_candidates(
+    df: pd.DataFrame,
+    *,
+    ratio_threshold: float = 0.92,
+    min_length: int = 6,
+) -> pd.DataFrame:
+    """Merge near-duplicate candidate names *within each race* (likely typos
+    like `DOUGHHERTY` vs `DOUGHERTY`). Within a race, names are processed in
+    vote-count order; the highest-vote spelling becomes canonical, and any
+    later spelling within `ratio_threshold` is remapped to it.
+
+    `min_length` (default 6) prevents short distinct names like `JOHN`/`JOAN`
+    from being collapsed. The 0.92 threshold leaves gov/president ticket
+    variants like `TRUMP` vs `TRUMP / VANCE` (~0.55) alone — fuzzy matching
+    is the wrong tool for that problem.
+    """
+    if df.empty:
+        return df
+
+    parts: list[pd.DataFrame] = []
+    for _, group in df.groupby('Race_Name', sort=False):
+        group = group.sort_values('Votes', ascending=False)
+        mapping: dict[str, str] = {}
+        canonicals: list[str] = []
+        for name in group['Candidate']:
+            if name in mapping:
+                continue
+            if len(name) < min_length:
+                mapping[name] = name
+                continue
+            matched = next(
+                (c for c in canonicals
+                 if SequenceMatcher(None, name, c).ratio() >= ratio_threshold),
+                None,
+            )
+            if matched is None:
+                canonicals.append(name)
+                mapping[name] = name
+            else:
+                mapping[name] = matched
+        group = group.copy()
+        group['Candidate'] = group['Candidate'].map(mapping)
+        parts.append(group)
+
+    combined = pd.concat(parts, ignore_index=True)
+    return combined.groupby(['Race_Name', 'Candidate'], as_index=False)['Votes'].sum()
 
 
 def _parse_openelections_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFrame:
@@ -214,6 +277,15 @@ def _parse_openelections_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFra
     party_col = df['party'] if 'party' in df.columns else pd.Series('', index=df.index)
     party = _normalize_text(party_col)
 
+    # Drop rows for office types that always require a district but where the
+    # district column is blank — leaving them in would silently merge candidates
+    # from many different districts into one bogus race.
+    bad = office.isin(_NEEDS_DISTRICT_OFFICES) & (district == '')
+    df = df[~bad].reset_index(drop=True)
+    office = office[~bad].reset_index(drop=True)
+    district = district[~bad].reset_index(drop=True)
+    party = party[~bad].reset_index(drop=True)
+
     if is_primary:
         race_name = party + ' ' + office + ' ' + district
     else:
@@ -232,6 +304,14 @@ def _coverage_from_counties(df: pd.DataFrame, expected: int = 67) -> str:
     """Build a coverage note like `"63 of 67 counties"` from the data itself."""
     n = df['county'].nunique() if 'county' in df.columns else 0
     return f"{n} of {expected} counties"
+
+
+# Offices that are always reported by district in PA. If a row has one of these
+# office names but no district, the row is unusable — leaving it in would
+# collapse candidates from many different districts into one bogus race (e.g.,
+# Philadelphia's 2024 State House rows have blank district, which would merge
+# 27+ unrelated reps into one entry).
+_NEEDS_DISTRICT_OFFICES = frozenset({'STATE HOUSE', 'STATE SENATE', 'U.S. HOUSE'})
 
 
 @dataclass(kw_only=True)
@@ -342,6 +422,16 @@ def filter_race_names(df: pd.DataFrame, pattern: Optional[str]) -> pd.DataFrame:
     return df[mask].copy()
 
 
+def filter_exclude_race_names(df: pd.DataFrame, pattern: Optional[str]) -> pd.DataFrame:
+    """Symmetric to filter_race_names: drop races whose name matches `pattern`
+    (case-insensitive regex). Used e.g. to drop President from the PA workbook
+    because cross-county ticket fragmentation makes its totals unreliable."""
+    if pattern is None:
+        return df
+    mask = df['Race_Name'].str.lower().str.contains(pattern, regex=True, na=False)
+    return df[~mask].copy()
+
+
 def format_for_sheet(df: pd.DataFrame) -> pd.DataFrame:
     """Return Candidate/Race_Name/Votes/Percent sorted with a blank row between races."""
     df = df[['Candidate', 'Race_Name', 'Votes', 'Percent']].copy()
@@ -363,19 +453,24 @@ def write_workbook(
     out_path: str,
     *,
     race_pattern: Optional[str] = None,
+    race_exclude_pattern: Optional[str] = None,
     threshold: float = 50.0,
     min_winner_votes: int = 100,
     min_candidate_percent: float = 1.0,
+    fuzzy_merge: bool = True,
 ) -> None:
     with pd.ExcelWriter(out_path, engine='xlsxwriter') as writer:
         for source in sources:
             print(f"Processing {source.name}...")
             tidy = source.fetch_tidy()
+            if fuzzy_merge:
+                tidy = fuzzy_canonicalize_candidates(tidy)
             tidy = add_percentages(tidy)
             tidy = filter_non_majority(tidy, threshold=threshold)
             tidy = filter_min_winner_votes(tidy, min_votes=min_winner_votes)
             tidy = filter_min_candidate_percent(tidy, min_percent=min_candidate_percent)
             tidy = filter_race_names(tidy, race_pattern)
+            tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
             sheet = format_for_sheet(tidy)
             sheet.to_excel(writer, sheet_name=source.name, index=False)
 
@@ -423,9 +518,11 @@ def write_workbook_pooled_by_category(
     out_path: str,
     *,
     race_pattern: Optional[str] = None,
+    race_exclude_pattern: Optional[str] = None,
     threshold: float = 50.0,
     min_winner_votes: int = 100,
     min_candidate_percent: float = 1.0,
+    fuzzy_merge: bool = True,
 ) -> None:
     """Group sources by `category`; emit one sheet per category, all years pooled.
 
@@ -441,11 +538,14 @@ def write_workbook_pooled_by_category(
             )
         print(f"Processing {source.name}...")
         tidy = source.fetch_tidy()
+        if fuzzy_merge:
+            tidy = fuzzy_canonicalize_candidates(tidy)
         tidy = add_percentages(tidy)
         tidy = filter_non_majority(tidy, threshold=threshold)
         tidy = filter_min_winner_votes(tidy, min_votes=min_winner_votes)
         tidy = filter_min_candidate_percent(tidy, min_percent=min_candidate_percent)
         tidy = filter_race_names(tidy, race_pattern)
+        tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
         race_count = tidy['Race_Name'].nunique() if not tidy.empty else 0
         print(f"  -> {race_count} non-majority races")
         by_cat.setdefault(source.category, []).append((source, tidy))
@@ -551,6 +651,12 @@ if __name__ == "__main__":
     print(f"Saved Philly workbook to '{philly_out}'")
 
     # --- OpenElections PA 2018+ ---
+    # Exclude President: cross-county ticket fragmentation ("TRUMP" / "TRUMP /
+    # VANCE" / "DONALD J TRUMP, PRESIDENT / JD VANCE, VICE-PRESIDENT" / etc.)
+    # makes totals unreliable without an external candidate roster.
     pa_out = "Pennsylvania_NonMajority_2018plus.xlsx"
-    write_workbook_pooled_by_category(OPENELECTIONS_PA_SOURCES, pa_out)
+    write_workbook_pooled_by_category(
+        OPENELECTIONS_PA_SOURCES, pa_out,
+        race_exclude_pattern=r"president",
+    )
     print(f"Saved PA workbook to '{pa_out}'")

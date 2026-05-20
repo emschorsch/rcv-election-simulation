@@ -9,14 +9,17 @@ import pytest
 
 from primary_scraper import (
     _parse_openelections_df,
+    _strip_middle_initials,
     _wide_columns_to_tidy,
     add_percentages,
+    filter_exclude_race_names,
     filter_min_candidate_percent,
     filter_min_winner_votes,
     filter_non_majority,
     filter_race_names,
     format_for_sheet,
     format_pooled_for_sheet,
+    fuzzy_canonicalize_candidates,
 )
 
 
@@ -281,6 +284,19 @@ def test_filter_race_names_no_match_returns_empty():
     assert len(out) == 0
 
 
+# --- filter_exclude_race_names ---------------------------------------------
+
+def test_filter_exclude_race_names_drops_matching_races():
+    df = pd.DataFrame({"Race_Name": ["PRESIDENT", "U.S. SENATE", "DEM PRESIDENT"]})
+    out = filter_exclude_race_names(df, r"president")
+    assert out['Race_Name'].tolist() == ["U.S. SENATE"]
+
+
+def test_filter_exclude_race_names_none_is_noop():
+    df = pd.DataFrame({"Race_Name": ["X", "Y"]})
+    pd.testing.assert_frame_equal(filter_exclude_race_names(df, None), df)
+
+
 # --- format_for_sheet -------------------------------------------------------
 
 def test_format_for_sheet_sorts_and_inserts_blank_between_races():
@@ -372,10 +388,120 @@ def test_oe_sums_votes_across_counties():
     assert out['Votes'].tolist() == [5300.0]
 
 
+# --- _strip_middle_initials ------------------------------------------------
+
+def test_strip_middle_initials_drops_single_letter_middle_tokens():
+    assert _strip_middle_initials("RYAN E MACKENZIE") == "RYAN MACKENZIE"
+    assert _strip_middle_initials("CHRISTINA M HARTMAN") == "CHRISTINA HARTMAN"
+    assert _strip_middle_initials("JOHN F K KENNEDY") == "JOHN KENNEDY"  # multiple
+
+
+def test_strip_middle_initials_preserves_first_and_last_tokens():
+    # Single-letter first tokens (like stage names "R KELLY") are preserved.
+    assert _strip_middle_initials("R KELLY") == "R KELLY"
+    # Multi-letter middle tokens (real names) are preserved.
+    assert _strip_middle_initials("MARY ANN SMITH") == "MARY ANN SMITH"
+    # Suffixes like JR/SR stay as the last token.
+    assert _strip_middle_initials("WAYNE LANGERHOLC JR") == "WAYNE LANGERHOLC JR"
+
+
+def test_strip_middle_initials_handles_short_names():
+    assert _strip_middle_initials("ALICE") == "ALICE"
+    assert _strip_middle_initials("ALICE SMITH") == "ALICE SMITH"
+
+
+# --- _normalize_candidate (commas + middle initials) -----------------------
+
+def test_oe_strips_comma_in_suffix():
+    # WAYNE LANGERHOLC, JR / WAYNE LANGERHOLC JR — comma is the only difference.
+    df = _oe_df([
+        {'county': 'A', 'office': 'X', 'district': '',
+         'party': 'R', 'candidate': 'Wayne Langerholc, Jr', 'votes': '100'},
+        {'county': 'B', 'office': 'X', 'district': '',
+         'party': 'R', 'candidate': 'Wayne Langerholc Jr', 'votes': '200'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Candidate'].tolist() == ['WAYNE LANGERHOLC JR']
+    assert out['Votes'].tolist() == [300.0]
+
+
+def test_oe_drops_middle_initial_in_candidate():
+    # RYAN E MACKENZIE / RYAN MACKENZIE — same person.
+    df = _oe_df([
+        {'county': 'A', 'office': 'X', 'district': '',
+         'party': 'R', 'candidate': 'Ryan E Mackenzie', 'votes': '100'},
+        {'county': 'B', 'office': 'X', 'district': '',
+         'party': 'R', 'candidate': 'Ryan Mackenzie', 'votes': '200'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Candidate'].tolist() == ['RYAN MACKENZIE']
+    assert out['Votes'].tolist() == [300.0]
+
+
+# --- fuzzy_canonicalize_candidates -----------------------------------------
+
+def test_fuzzy_canonicalize_merges_typo_variants_into_higher_vote_spelling():
+    # SHAUN DOUGHERTY (200 votes) and the typo SHAUN DOUGHHERTY (50 votes) —
+    # ratio 0.97, well above the 0.92 default. Higher-vote spelling wins.
+    df = pd.DataFrame({
+        "Race_Name": ["X", "X"],
+        "Candidate": ["SHAUN DOUGHERTY", "SHAUN DOUGHHERTY"],
+        "Votes": [200.0, 50.0],
+    })
+    out = fuzzy_canonicalize_candidates(df)
+    assert out['Candidate'].tolist() == ['SHAUN DOUGHERTY']
+    assert out['Votes'].tolist() == [250.0]
+
+
+def test_fuzzy_canonicalize_does_not_merge_distinct_short_names():
+    # JOHN vs JOAN — ratio ~0.75 AND both are below the 6-char min_length.
+    # Must not merge.
+    df = pd.DataFrame({
+        "Race_Name": ["X", "X"],
+        "Candidate": ["JOHN", "JOAN"],
+        "Votes": [100.0, 80.0],
+    })
+    out = fuzzy_canonicalize_candidates(df)
+    assert set(out['Candidate']) == {"JOHN", "JOAN"}
+
+
+def test_fuzzy_canonicalize_leaves_ticket_variants_alone():
+    # PA gov/president ticket fragmentation: TRUMP vs TRUMP / VANCE.
+    # Ratio ~0.55, well below the 0.92 default — fuzzy must not merge them.
+    df = pd.DataFrame({
+        "Race_Name": ["PRESIDENT", "PRESIDENT"],
+        "Candidate": ["DONALD J TRUMP", "TRUMP / VANCE"],
+        "Votes": [2_700_000.0, 250_000.0],
+    })
+    out = fuzzy_canonicalize_candidates(df)
+    assert set(out['Candidate']) == {"DONALD J TRUMP", "TRUMP / VANCE"}
+
+
+def test_fuzzy_canonicalize_only_merges_within_same_race():
+    # Same near-duplicate name appearing in two different races stays separate.
+    df = pd.DataFrame({
+        "Race_Name": ["MAYOR", "MAYOR", "GOVERNOR", "GOVERNOR"],
+        "Candidate": ["SHAUN DOUGHERTY", "SHAUN DOUGHHERTY",
+                       "SHAUN DOUGHERTY", "SHAUN DOUGHHERTY"],
+        "Votes": [200.0, 50.0, 300.0, 60.0],
+    })
+    out = fuzzy_canonicalize_candidates(df)
+    # Both races collapse to canonical name, but the rows remain race-separated.
+    by_race = dict(zip(out['Race_Name'], out['Votes']))
+    assert by_race == {"MAYOR": 250.0, "GOVERNOR": 360.0}
+
+
+def test_fuzzy_canonicalize_empty_input_returns_empty():
+    df = pd.DataFrame(columns=['Race_Name', 'Candidate', 'Votes'])
+    out = fuzzy_canonicalize_candidates(df)
+    assert len(out) == 0
+
+
 def test_oe_strips_periods_and_party_suffix_from_candidate():
     # Real-world bug: some 2024 PA counties wrote candidates as "DAVE SUNDAY REP"
     # (party suffix from cross-filed ballot lines) and "RICHARD L. WEISS" vs
-    # "RICHARD L WEISS". Normalization should collapse all variants.
+    # "RICHARD L WEISS". Normalization collapses all variants — also dropping
+    # the middle-initial "L" so all four rows for Weiss merge.
     df = _oe_df([
         {'county': 'Adams', 'office': 'AG', 'district': '',
          'party': 'REP', 'candidate': 'DAVE SUNDAY REP', 'votes': '100'},
@@ -388,7 +514,7 @@ def test_oe_strips_periods_and_party_suffix_from_candidate():
     ])
     out = _parse_openelections_df(df, is_primary=False)
     by_cand = dict(zip(out['Candidate'], out['Votes']))
-    assert by_cand == {'DAVE SUNDAY': 300.0, 'RICHARD L WEISS': 12.0}
+    assert by_cand == {'DAVE SUNDAY': 300.0, 'RICHARD WEISS': 12.0}
 
 
 def test_oe_drops_election_admin_pseudo_candidates():
@@ -446,6 +572,39 @@ def test_oe_votes_coerced_to_zero_when_missing():
     ])
     out = _parse_openelections_df(df, is_primary=False)
     assert out['Votes'].tolist() == [0.0]
+
+
+def test_oe_drops_district_required_rows_when_district_is_blank():
+    # 2024 Philadelphia State House rows have blank district in OpenElections;
+    # leaving them in would merge 20+ unrelated reps into a single "STATE HOUSE"
+    # race. The parser must drop them.
+    df = _oe_df([
+        {'county': 'Philly', 'office': 'State House', 'district': '',
+         'party': 'DEM', 'candidate': 'Chris Rabb', 'votes': '500'},
+        {'county': 'Philly', 'office': 'State House', 'district': '',
+         'party': 'DEM', 'candidate': 'Ben Waxman', 'votes': '600'},
+        {'county': 'Adams', 'office': 'State House', 'district': '76',
+         'party': 'DEM', 'candidate': 'Joe Waltz', 'votes': '300'},
+        {'county': 'Adams', 'office': 'U.S. House', 'district': '',
+         'party': 'DEM', 'candidate': 'Some Person', 'votes': '999'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    # Only the districted State House 76 row survives.
+    assert out['Race_Name'].tolist() == ['STATE HOUSE 76']
+    assert out['Candidate'].tolist() == ['JOE WALTZ']
+
+
+def test_oe_keeps_district_less_rows_for_statewide_offices():
+    # President, US Senate, Governor, AG, etc. don't have districts — blank
+    # district must NOT cause them to be dropped.
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': '100'},
+        {'county': 'Adams', 'office': 'U.S. Senate', 'district': '',
+         'party': 'DEM', 'candidate': 'Casey', 'votes': '200'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert set(out['Race_Name']) == {'PRESIDENT', 'U.S. SENATE'}
 
 
 def test_oe_missing_party_column_does_not_crash():
