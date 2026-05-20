@@ -149,8 +149,10 @@ def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_non_majority(df: pd.DataFrame, threshold: float = 50.0) -> pd.DataFrame:
+    # Keep races where the leader did not *exceed* the threshold — a 50/50 tie
+    # is a non-majority outcome RCV would have to resolve, so it stays in.
     max_percent = df.groupby('Race_Name')['Percent'].transform('max')
-    return df[max_percent < threshold].copy()
+    return df[max_percent <= threshold].copy()
 
 
 def filter_race_names(df: pd.DataFrame, pattern: Optional[str]) -> pd.DataFrame:

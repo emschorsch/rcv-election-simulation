@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+.pytest_cache/
+
+# Generated election workbooks (root-level outputs of primary_scraper.py)
+/*.xlsx
+
+# Editor / IDE
+.idea/
+
+# Claude Code session state
+.claude/
