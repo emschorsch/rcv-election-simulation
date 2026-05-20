@@ -11,6 +11,7 @@ from primary_scraper import (
     _parse_openelections_df,
     _wide_columns_to_tidy,
     add_percentages,
+    filter_min_candidate_percent,
     filter_min_winner_votes,
     filter_non_majority,
     filter_race_names,
@@ -221,6 +222,38 @@ def test_filter_min_winner_votes_at_exact_threshold_kept():
         "Candidate": ["A", "B"], "Race_Name": ["X", "X"], "Votes": [100, 50],
     })
     assert len(filter_min_winner_votes(df, min_votes=100)) == 2
+
+
+# --- filter_min_candidate_percent ------------------------------------------
+
+def test_filter_min_candidate_percent_drops_long_tail_within_race():
+    df = pd.DataFrame({
+        "Candidate": ["A", "B", "C", "D"],
+        "Race_Name": ["X", "X", "X", "X"],
+        "Votes": [400, 300, 5, 1],
+        "Percent": [55.0, 41.0, 0.7, 0.1],
+    })
+    out = filter_min_candidate_percent(df, min_percent=1.0)
+    assert out['Candidate'].tolist() == ["A", "B"]
+
+
+def test_filter_min_candidate_percent_keeps_exact_threshold():
+    df = pd.DataFrame({
+        "Candidate": ["A", "B"], "Race_Name": ["X", "X"],
+        "Votes": [99, 1], "Percent": [99.0, 1.0],
+    })
+    assert len(filter_min_candidate_percent(df, min_percent=1.0)) == 2
+
+
+def test_filter_min_candidate_percent_does_not_remove_winner():
+    # The pruning is a display filter — it should never drop a top finisher
+    # since their percent is always at least 1 / num_candidates.
+    df = pd.DataFrame({
+        "Candidate": ["A", "B"], "Race_Name": ["X", "X"],
+        "Votes": [49, 47], "Percent": [49.0, 47.0],
+    })
+    out = filter_min_candidate_percent(df, min_percent=1.0)
+    assert set(out['Candidate']) == {"A", "B"}
 
 
 # --- filter_race_names ------------------------------------------------------

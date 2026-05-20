@@ -328,6 +328,13 @@ def filter_min_winner_votes(df: pd.DataFrame, min_votes: int = 100) -> pd.DataFr
     return df[max_votes >= min_votes].copy()
 
 
+def filter_min_candidate_percent(df: pd.DataFrame, min_percent: float = 1.0) -> pd.DataFrame:
+    """Drop individual candidate rows below `min_percent`. Display filter only —
+    percentages are not recomputed, so the surviving rows still reflect each
+    candidate's share of the *full* race total."""
+    return df[df['Percent'] >= min_percent].copy()
+
+
 def filter_race_names(df: pd.DataFrame, pattern: Optional[str]) -> pd.DataFrame:
     if pattern is None:
         return df
@@ -358,6 +365,7 @@ def write_workbook(
     race_pattern: Optional[str] = None,
     threshold: float = 50.0,
     min_winner_votes: int = 100,
+    min_candidate_percent: float = 1.0,
 ) -> None:
     with pd.ExcelWriter(out_path, engine='xlsxwriter') as writer:
         for source in sources:
@@ -366,6 +374,7 @@ def write_workbook(
             tidy = add_percentages(tidy)
             tidy = filter_non_majority(tidy, threshold=threshold)
             tidy = filter_min_winner_votes(tidy, min_votes=min_winner_votes)
+            tidy = filter_min_candidate_percent(tidy, min_percent=min_candidate_percent)
             tidy = filter_race_names(tidy, race_pattern)
             sheet = format_for_sheet(tidy)
             sheet.to_excel(writer, sheet_name=source.name, index=False)
@@ -416,6 +425,7 @@ def write_workbook_pooled_by_category(
     race_pattern: Optional[str] = None,
     threshold: float = 50.0,
     min_winner_votes: int = 100,
+    min_candidate_percent: float = 1.0,
 ) -> None:
     """Group sources by `category`; emit one sheet per category, all years pooled.
 
@@ -434,6 +444,7 @@ def write_workbook_pooled_by_category(
         tidy = add_percentages(tidy)
         tidy = filter_non_majority(tidy, threshold=threshold)
         tidy = filter_min_winner_votes(tidy, min_votes=min_winner_votes)
+        tidy = filter_min_candidate_percent(tidy, min_percent=min_candidate_percent)
         tidy = filter_race_names(tidy, race_pattern)
         race_count = tidy['Race_Name'].nunique() if not tidy.empty else 0
         print(f"  -> {race_count} non-majority races")
