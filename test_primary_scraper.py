@@ -2,15 +2,19 @@
 
 Run with: `pytest test_primary_scraper.py`
 """
+from types import SimpleNamespace
+
 import pandas as pd
 import pytest
 
 from primary_scraper import (
+    _parse_openelections_df,
     _wide_columns_to_tidy,
     add_percentages,
     filter_non_majority,
     filter_race_names,
     format_for_sheet,
+    format_pooled_for_sheet,
 )
 
 
@@ -222,3 +226,224 @@ def test_format_for_sheet_empty_input():
     out = format_for_sheet(df)
     assert len(out) == 0
     assert list(out.columns) == ["Candidate", "Race_Name", "Votes", "Percent"]
+
+
+# --- _parse_openelections_df -----------------------------------------------
+
+def _oe_df(rows):
+    """Build an OpenElections-style DataFrame from a list of dicts."""
+    cols = ['county', 'office', 'district', 'party', 'candidate', 'votes']
+    return pd.DataFrame(rows, columns=cols).astype(str).replace('nan', '')
+
+
+def test_oe_general_race_name_uses_office_only_when_no_district():
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': '100'},
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'REP', 'candidate': 'Trump', 'votes': '200'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    # General: party is *not* part of race name, so Biden and Trump share a race.
+    # Names are upper-cased by the parser to merge case-variant spellings.
+    assert set(out['Race_Name']) == {'PRESIDENT'}
+    assert set(out['Candidate']) == {'BIDEN', 'TRUMP'}
+
+
+def test_oe_general_race_name_appends_district():
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'U.S. House', 'district': '12',
+         'party': 'DEM', 'candidate': 'Griffin', 'votes': '50'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Race_Name'].tolist() == ['U.S. HOUSE 12']
+
+
+def test_oe_primary_race_name_prepends_party():
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': '100'},
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'REP', 'candidate': 'Trump', 'votes': '200'},
+    ])
+    out = _parse_openelections_df(df, is_primary=True)
+    assert set(out['Race_Name']) == {'DEM PRESIDENT', 'REP PRESIDENT'}
+
+
+def test_oe_drops_meta_rows_with_empty_candidate():
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'Registered Voters', 'district': '',
+         'party': '', 'candidate': '', 'votes': '500'},
+        {'county': 'Adams', 'office': 'Ballots Cast', 'district': '',
+         'party': '', 'candidate': '', 'votes': '400'},
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': '100'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Candidate'].tolist() == ['BIDEN']
+    assert out['Race_Name'].tolist() == ['PRESIDENT']
+
+
+def test_oe_sums_votes_across_counties():
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': '100'},
+        {'county': 'Allegheny', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': '5000'},
+        {'county': 'Berks', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': '200'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Votes'].tolist() == [5300.0]
+
+
+def test_oe_strips_periods_and_party_suffix_from_candidate():
+    # Real-world bug: some 2024 PA counties wrote candidates as "DAVE SUNDAY REP"
+    # (party suffix from cross-filed ballot lines) and "RICHARD L. WEISS" vs
+    # "RICHARD L WEISS". Normalization should collapse all variants.
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'AG', 'district': '',
+         'party': 'REP', 'candidate': 'DAVE SUNDAY REP', 'votes': '100'},
+        {'county': 'Berks', 'office': 'AG', 'district': '',
+         'party': 'REP', 'candidate': 'Dave Sunday', 'votes': '200'},
+        {'county': 'Clinton', 'office': 'AG', 'district': '',
+         'party': 'GRN', 'candidate': 'Richard L. Weiss', 'votes': '5'},
+        {'county': 'Dauphin', 'office': 'AG', 'district': '',
+         'party': 'GRN', 'candidate': 'RICHARD L WEISS GRN', 'votes': '7'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    by_cand = dict(zip(out['Candidate'], out['Votes']))
+    assert by_cand == {'DAVE SUNDAY': 300.0, 'RICHARD L WEISS': 12.0}
+
+
+def test_oe_drops_election_admin_pseudo_candidates():
+    # OVER VOTES / UNDER VOTES / WRITE-IN TOTALS / NOT ASSIGNED inflate the
+    # race denominator and falsely lower every real candidate's share, so they
+    # are stripped before percentage calculation upstream.
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'AG', 'district': '',
+         'party': 'DEM', 'candidate': 'Real Person', 'votes': '100'},
+        {'county': 'Adams', 'office': 'AG', 'district': '',
+         'party': '', 'candidate': 'Over Votes', 'votes': '5'},
+        {'county': 'Adams', 'office': 'AG', 'district': '',
+         'party': '', 'candidate': 'Under Votes', 'votes': '10'},
+        {'county': 'Adams', 'office': 'AG', 'district': '',
+         'party': '', 'candidate': 'Write-in Totals', 'votes': '3'},
+        {'county': 'Adams', 'office': 'AG', 'district': '',
+         'party': '', 'candidate': 'Not Assigned', 'votes': '2'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Candidate'].tolist() == ['REAL PERSON']
+
+
+def test_oe_merges_case_variants_of_same_candidate():
+    # Real-world bug: 2020 PA AG file had both "JOSH SHAPIRO" and "Josh Shapiro"
+    # across counties, splitting his vote and falsely flagging the race as
+    # non-majority. Upper-case normalization should merge them.
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'Attorney General', 'district': '',
+         'party': 'DEM', 'candidate': 'JOSH SHAPIRO', 'votes': '100'},
+        {'county': 'Allegheny', 'office': 'Attorney General', 'district': '',
+         'party': 'DEM', 'candidate': 'Josh Shapiro', 'votes': '200'},
+        {'county': 'Berks', 'office': 'Attorney General', 'district': '',
+         'party': 'DEM', 'candidate': '  Josh  Shapiro  ', 'votes': '50'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Candidate'].tolist() == ['JOSH SHAPIRO']
+    assert out['Votes'].tolist() == [350.0]
+
+
+def test_oe_write_ins_survive_with_empty_party():
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': '100'},
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': '', 'candidate': 'Write-ins', 'votes': '5'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert set(out['Candidate']) == {'BIDEN', 'WRITE-INS'}
+
+
+def test_oe_votes_coerced_to_zero_when_missing():
+    df = _oe_df([
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': 'DEM', 'candidate': 'Biden', 'votes': ''},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Votes'].tolist() == [0.0]
+
+
+def test_oe_missing_party_column_does_not_crash():
+    df = pd.DataFrame([
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'candidate': 'Biden', 'votes': '100'},
+    ]).astype(str)
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Race_Name'].tolist() == ['PRESIDENT']
+
+
+# --- format_pooled_for_sheet -----------------------------------------------
+
+def test_format_pooled_emits_year_and_coverage_columns():
+    source = SimpleNamespace(year=2020, coverage_note="67 of 67 counties")
+    df = pd.DataFrame({
+        "Candidate": ["A", "B"],
+        "Race_Name": ["X", "X"],
+        "Votes": [50, 50],
+        "Percent": [50.0, 50.0],
+    })
+    out = format_pooled_for_sheet([(source, df)])
+    assert list(out.columns) == ['Year', 'Race_Name', 'Candidate', 'Votes', 'Percent', 'Coverage']
+    non_blank = out[out['Race_Name'] != '']
+    assert set(non_blank['Year']) == {2020}
+    assert set(non_blank['Coverage']) == {"67 of 67 counties"}
+
+
+def test_format_pooled_sorts_by_year_then_race_then_votes_desc():
+    s2020 = SimpleNamespace(year=2020, coverage_note="")
+    s2018 = SimpleNamespace(year=2018, coverage_note="")
+    df_2020 = pd.DataFrame({
+        "Candidate": ["B", "A"], "Race_Name": ["Y", "Y"],
+        "Votes": [20, 30], "Percent": [40.0, 60.0],
+    })
+    df_2018 = pd.DataFrame({
+        "Candidate": ["D", "C"], "Race_Name": ["X", "X"],
+        "Votes": [10, 40], "Percent": [20.0, 80.0],
+    })
+    out = format_pooled_for_sheet([(s2020, df_2020), (s2018, df_2018)])
+    non_blank = out[out['Race_Name'] != '']
+    # Expect: 2018 X (C 40, D 10), then 2020 Y (A 30, B 20).
+    assert non_blank['Year'].tolist() == [2018, 2018, 2020, 2020]
+    assert non_blank['Race_Name'].tolist() == ['X', 'X', 'Y', 'Y']
+    assert non_blank['Candidate'].tolist() == ['C', 'D', 'A', 'B']
+
+
+def test_format_pooled_inserts_blank_row_between_race_groups():
+    source = SimpleNamespace(year=2020, coverage_note="")
+    df = pd.DataFrame({
+        "Candidate": ["A", "B", "C"],
+        "Race_Name": ["X", "X", "Y"],
+        "Votes": [30, 20, 10],
+        "Percent": [60.0, 40.0, 100.0],
+    })
+    out = format_pooled_for_sheet([(source, df)])
+    # Expect rows: X-A, X-B, blank, Y-C, blank
+    assert out['Race_Name'].tolist() == ['X', 'X', '', 'Y', '']
+
+
+def test_format_pooled_empty_input_returns_empty_with_correct_columns():
+    out = format_pooled_for_sheet([])
+    assert len(out) == 0
+    assert list(out.columns) == ['Year', 'Race_Name', 'Candidate', 'Votes', 'Percent', 'Coverage']
+
+
+def test_format_pooled_skips_sources_with_empty_dataframes():
+    source_empty = SimpleNamespace(year=2018, coverage_note="x")
+    source_data = SimpleNamespace(year=2020, coverage_note="y")
+    empty_df = pd.DataFrame(columns=["Candidate", "Race_Name", "Votes", "Percent"])
+    data_df = pd.DataFrame({
+        "Candidate": ["A"], "Race_Name": ["X"], "Votes": [50], "Percent": [50.0],
+    })
+    out = format_pooled_for_sheet([(source_empty, empty_df), (source_data, data_df)])
+    non_blank = out[out['Race_Name'] != '']
+    assert non_blank['Year'].tolist() == [2020]
