@@ -2,6 +2,10 @@
 __pycache__/
 .pytest_cache/
 
+# LLM extraction cache (Claude PDF→tidy results, hashed by source URL).
+# Safe to delete; will be re-fetched (and re-billed) on next run.
+.cache/
+
 # Generated election workbooks (root-level outputs of primary_scraper.py)
 /*.xlsx
 

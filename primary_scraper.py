@@ -13,13 +13,16 @@ instance to the source list at the bottom. If no shape matches, write a new
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -170,13 +173,21 @@ _PARTY_SUFFIX_RE = re.compile(r'\s+(?:' + '|'.join(_PARTY_CODES) + r')\s*$')
 # real candidate's share, producing false non-majority hits.
 _NON_CANDIDATE_NAMES = frozenset({
     'OVER VOTES', 'UNDER VOTES', 'OVERVOTES', 'UNDERVOTES',
-    'NOT ASSIGNED', 'WRITE-IN TOTALS', 'WRITE IN TOTALS',
-    # Aggregate write-in entries get filtered out because they're typically
-    # the *sum* of the individual named write-in rows in the same file —
-    # leaving them in double-counts and inflates the apparent field size in
-    # write-in-heavy races (e.g., a borough mayoral with no listed candidate).
-    'WRITE-IN', 'WRITE-INS', 'WRITE IN', 'WRITE INS', 'WRITEIN', 'WRITEINS',
+    'NOT ASSIGNED', 'SCATTERED',
 })
+
+# Anything matching this is treated as a write-in aggregate/variant and
+# dropped — covers `WRITE-IN`, `WRITE-INS`, `WRITE-IN (TOTAL)`,
+# `UNASSIGNED WRITE-INS`, `UNRESOLVED WRITE-IN`, `WRITE-IN: SCATTERED`,
+# `WRITEIN`, etc. Real candidate names should never contain this substring.
+_WRITE_IN_RE = re.compile(r'WRITE.?IN', re.IGNORECASE)
+
+
+def _is_non_candidate(s: pd.Series) -> pd.Series:
+    """Boolean mask: True where the candidate name should be dropped because
+    it's election-admin metadata (over/under votes, write-in aggregate, etc.)
+    rather than a real listed candidate."""
+    return s.isin(_NON_CANDIDATE_NAMES) | s.str.contains(_WRITE_IN_RE, regex=True, na=False)
 
 
 def _strip_middle_initials(name: str) -> str:
@@ -190,12 +201,18 @@ def _strip_middle_initials(name: str) -> str:
     return ' '.join([parts[0]] + middle + [parts[-1]])
 
 
+_CANDIDATE_ID_PREFIX_RE = re.compile(r'^\(\d+\)\s*')
+
+
 def _normalize_candidate(s: pd.Series) -> pd.Series:
     """Canonicalize candidate names so cross-county variants collapse to one row.
 
     Steps, in order: upper-case, strip periods/commas/apostrophes, collapse
-    whitespace, drop a trailing party code (`DAVE SUNDAY REP` → `DAVE SUNDAY`),
-    and drop single-letter middle tokens (`RYAN E MACKENZIE` → `RYAN MACKENZIE`).
+    whitespace, drop a leading `(NNN)` row-ID prefix (Clarity Delaware lists
+    candidates as `"(82) MIKE JOHNSON"` — cross-filed entries get different
+    IDs but should be merged), drop a trailing party code (`DAVE SUNDAY REP`
+    → `DAVE SUNDAY`), and drop single-letter middle tokens (`RYAN E MACKENZIE`
+    → `RYAN MACKENZIE`).
 
     Does NOT attempt to merge gov/president ticket variants like
     `SHAPIRO / DAVIS` vs `JOSH SHAPIRO` vs `JOSH SHAPIRO AUSTIN DAVIS` — those
@@ -208,6 +225,7 @@ def _normalize_candidate(s: pd.Series) -> pd.Series:
         .str.replace(r'\s+', ' ', regex=True)
         .str.strip()
     )
+    out = out.str.replace(_CANDIDATE_ID_PREFIX_RE, '', regex=True).str.strip()
     out = out.str.replace(_PARTY_SUFFIX_RE, '', regex=True).str.strip()
     out = out.map(_strip_middle_initials)
     return out
@@ -275,7 +293,7 @@ def _parse_openelections_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFra
     df = df.copy()
     df['_candidate'] = _normalize_candidate(df['candidate'])
     df = df[df['_candidate'] != '']
-    df = df[~df['_candidate'].isin(_NON_CANDIDATE_NAMES)].reset_index(drop=True)
+    df = df[~_is_non_candidate(df['_candidate'])].reset_index(drop=True)
 
     office = _normalize_text(df['office'])
     district = df['district'].fillna('').astype(str).str.strip()
@@ -460,7 +478,7 @@ def _parse_wprdc_summary_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFra
         )
 
     candidate = _normalize_candidate(df['choice_name'])
-    valid = (candidate != '') & ~candidate.isin(_NON_CANDIDATE_NAMES)
+    valid = (candidate != '') & ~_is_non_candidate(candidate)
 
     tidy = pd.DataFrame({
         'Candidate': candidate[valid].reset_index(drop=True),
@@ -484,6 +502,246 @@ class WprdcCsvSource(ElectionSource):
     def fetch_tidy(self) -> pd.DataFrame:
         df = pd.read_csv(self.url, dtype=str)
         return _parse_wprdc_summary_df(df, is_primary=self.is_primary)
+
+
+# Map from Clarity's verbose "CAT" category label to the short party code we
+# prepend to primary contest names so behavior matches the WPRDC parser.
+_CLARITY_CAT_TO_PARTY = {
+    'DEMOCRATIC': 'DEM',
+    'REPUBLICAN': 'REP',
+    'LIBERTARIAN': 'LIB',
+    'GREEN': 'GRN',
+    'INDEPENDENT': 'IND',
+    'CONSTITUTION': 'CON',
+}
+
+# Trailing "(DEM)" / "(REP)" / etc. parenthetical on Clarity contest names —
+# duplicates the CAT field, so we strip it to get a clean contest name.
+_CLARITY_PARTY_PAREN_RE = re.compile(
+    r'\s*\((?:' + '|'.join(_PARTY_CODES) + r')\)\s*$', re.IGNORECASE
+)
+
+
+def _parse_clarity_summary_json(data: list[dict], *, is_primary: bool) -> pd.DataFrame:
+    """Aggregate Clarity Elections summary.json into [Candidate, Race_Name, Votes].
+
+    Each entry in `data` is a contest with `CAT` (category, often a party
+    label), `C` (contest name), `VF` (vote-for-N), `CH` (parallel list of
+    candidate names), `V` (parallel list of vote counts), and `P` (parallel
+    list of per-candidate party tags). Multi-seat contests (VF>1) are dropped
+    because IRV's majority concept doesn't apply.
+
+    For primaries we prepend the short party code derived from CAT to the
+    contest name when not already prefixed — same conditional-prepend logic
+    as the WPRDC parser. The trailing "(DEM)" duplicate is also stripped.
+    """
+    rows = []
+    for contest in data:
+        if int(contest.get('VF') or 1) > 1:
+            continue  # multi-seat — skip
+        contest_name = str(contest.get('C') or '').strip()
+        contest_name = _CLARITY_PARTY_PAREN_RE.sub('', contest_name).strip()
+        if not contest_name:
+            continue
+        cat = str(contest.get('CAT') or '').strip().upper()
+        party_prefix = _CLARITY_CAT_TO_PARTY.get(cat, '')
+        if is_primary and party_prefix:
+            first_word = contest_name.split(' ', 1)[0].upper()
+            if first_word not in _PARTY_CODES:
+                contest_name = f"{party_prefix} {contest_name}"
+        choices = contest.get('CH') or []
+        votes = contest.get('V') or []
+        for choice, v in zip(choices, votes):
+            rows.append({
+                'choice_name': choice,
+                'contest_name': contest_name,
+                'votes': v,
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=['Candidate', 'Race_Name', 'Votes'])
+
+    df = pd.DataFrame(rows)
+    candidate = _normalize_candidate(df['choice_name'])
+    valid = (candidate != '') & ~_is_non_candidate(candidate)
+
+    tidy = pd.DataFrame({
+        'Candidate': candidate[valid].reset_index(drop=True),
+        'Race_Name': df.loc[valid, 'contest_name'].reset_index(drop=True),
+        'Votes': pd.to_numeric(df.loc[valid, 'votes'], errors='coerce')
+                    .fillna(0).reset_index(drop=True),
+    })
+    return tidy.groupby(['Race_Name', 'Candidate'], as_index=False)['Votes'].sum()
+
+
+# Browser User-Agent for CloudFront-fronted services (Clarity Elections).
+# CloudFront 403s requests with non-browser UAs.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+)
+
+
+@dataclass(kw_only=True)
+class ClaritySummaryJsonSource(ElectionSource):
+    """Pull election results from a Clarity Elections summary.json endpoint.
+
+    Base URL is e.g. https://results.enr.clarityelections.com/PA/York/117795/
+    — we fetch <base>/current_ver.txt to discover the live version, then
+    <base>/<ver>/json/en/summary.json. CloudFront blocks non-browser UAs so
+    we send a Safari UA on every request.
+    """
+    is_primary: bool = False
+    user_agent: str = _BROWSER_UA
+
+    def fetch_tidy(self) -> pd.DataFrame:
+        base = self.url.rstrip('/')
+        version = self._get(f"{base}/current_ver.txt").decode().strip()
+        data = json.loads(self._get(f"{base}/{version}/json/en/summary.json"))
+        return _parse_clarity_summary_json(data, is_primary=self.is_primary)
+
+    def _get(self, url: str) -> bytes:
+        req = urllib.request.Request(url, headers={'User-Agent': self.user_agent})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Failed to fetch Clarity URL {url}: {e}") from e
+
+
+# Cache directory for LLM PDF extractions. First-extraction calls Claude;
+# subsequent runs read from disk so reruns are free and offline-capable.
+_LLM_CACHE_DIR = Path(__file__).parent / '.cache' / 'llm'
+
+
+def _llm_cache_path(url: str) -> Path:
+    """Stable per-URL cache filename."""
+    h = hashlib.sha256(url.encode()).hexdigest()[:16]
+    return _LLM_CACHE_DIR / f"{h}.json"
+
+
+_LLM_EXTRACTION_PROMPT = (
+    "Extract every contest and candidate from this election results PDF. "
+    "For each (contest, candidate) pair output one row. Skip non-candidate "
+    "rows like 'Registered Voters', 'Ballots Cast', 'Over Votes', 'Under "
+    "Votes', and aggregated 'Write-In Totals'. For primary elections, the "
+    "contest name typically starts with the party (DEM/REP/etc.) — preserve "
+    "that prefix. Use the candidate's name exactly as printed. Use the "
+    "total vote count summed across all voting methods (in-person + "
+    "absentee + mail-in + provisional). If a contest has 'Vote for N' "
+    "where N>1, still include all its candidates."
+)
+
+
+def _extract_pdf_via_claude(pdf_url: str, *, model: str = "claude-sonnet-4-6") -> list[dict]:
+    """Extract election results from a PDF via Claude with tool_use for
+    structured output. Results are cached to .cache/llm/<hash>.json keyed by
+    URL — first call hits the API, subsequent calls are free.
+
+    Returns a list of dicts: [{contest_name, candidate, party, votes}, ...].
+    """
+    cache_path = _llm_cache_path(pdf_url)
+    if cache_path.exists():
+        return json.loads(cache_path.read_text())
+
+    from anthropic import Anthropic  # lazy import — Phase A doesn't need it
+    client = Anthropic()
+
+    tool_schema = {
+        "name": "submit_election_results",
+        "description": "Submit the extracted election results.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "contest_name": {"type": "string"},
+                            "candidate": {"type": "string"},
+                            "party": {"type": "string"},
+                            "votes": {"type": "integer"},
+                        },
+                        "required": ["contest_name", "candidate", "votes"],
+                    },
+                }
+            },
+            "required": ["rows"],
+        },
+    }
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=16000,
+        tools=[tool_schema],
+        tool_choice={"type": "tool", "name": "submit_election_results"},
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "document", "source": {"type": "url", "url": pdf_url}},
+                {"type": "text", "text": _LLM_EXTRACTION_PROMPT},
+            ],
+        }],
+    )
+    rows = next(
+        block.input["rows"]
+        for block in response.content
+        if block.type == "tool_use"
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(rows, indent=2))
+    return rows
+
+
+def _llm_rows_to_tidy(rows: list[dict], *, is_primary: bool) -> pd.DataFrame:
+    """Convert raw LLM-extracted rows into the standard tidy frame.
+
+    Applies the same candidate canonicalization and meta-row filtering used
+    elsewhere. If the LLM forgot to include a party prefix on a primary
+    contest, prepend it from the row's `party` field — same conditional
+    safety net as the WPRDC parser.
+    """
+    if not rows:
+        return pd.DataFrame(columns=['Candidate', 'Race_Name', 'Votes'])
+
+    df = pd.DataFrame(rows)
+    contest_base = df['contest_name'].fillna('').astype(str).str.strip()
+
+    if is_primary and 'party' in df.columns:
+        party = df['party'].fillna('').astype(str).str.strip().str.upper()
+        first_word = contest_base.str.split(' ', n=1).str[0].str.upper()
+        already_prefixed = first_word.isin(_PARTY_CODES)
+        contest_base = contest_base.where(
+            already_prefixed | (party == ''),
+            party + ' ' + contest_base,
+        )
+
+    candidate = _normalize_candidate(df['candidate'])
+    valid = (candidate != '') & ~_is_non_candidate(candidate)
+
+    tidy = pd.DataFrame({
+        'Candidate': candidate[valid].reset_index(drop=True),
+        'Race_Name': contest_base[valid].reset_index(drop=True),
+        'Votes': pd.to_numeric(df.loc[valid, 'votes'], errors='coerce')
+                    .fillna(0).reset_index(drop=True),
+    })
+    return tidy.groupby(['Race_Name', 'Candidate'], as_index=False)['Votes'].sum()
+
+
+@dataclass(kw_only=True)
+class LlmPdfSource(ElectionSource):
+    """Extract election results from a PDF using Claude (tool_use) for
+    structured output. Results are cached to .cache/llm/ so reruns don't
+    incur API cost. Generic — works for any election-results PDF, though
+    tuned for the official county summary PDFs (Berks, etc.)."""
+    is_primary: bool = False
+    model: str = "claude-sonnet-4-6"
+
+    def fetch_tidy(self) -> pd.DataFrame:
+        print(f"  extracting via Claude ({self.model})...")
+        rows = _extract_pdf_via_claude(self.url, model=self.model)
+        return _llm_rows_to_tidy(rows, is_primary=self.is_primary)
 
 
 # --- Pipeline ---------------------------------------------------------------
@@ -815,6 +1073,84 @@ PA_LOCAL_2025_SOURCES: list[ElectionSource] = [
 ]
 
 
+# Clarity Elections sources for mid-sized PA counties. Election IDs are
+# per-county per-election numeric identifiers Clarity assigns; discovered
+# from each county's official results page. The base URL pattern is
+# https://results.enr.clarityelections.com/PA/<County>/<id>/.
+
+_CLARITY_BASE = "https://results.enr.clarityelections.com/PA/"
+
+CLARITY_PA_SOURCES: list[ElectionSource] = [
+    # York County (R-leaning) — 3 primaries on Clarity. Strong source of
+    # competitive REP primary races for bipartisan motivating examples.
+    ClaritySummaryJsonSource(
+        name="2023 York Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="York County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "York/117795/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2024 York Primary", year=2024, category="Primaries", is_primary=True,
+        coverage_note="York County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "York/120831/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2025 York Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="York County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "York/123816/",
+    ),
+    # Delaware County (D-leaning Philly suburb) — 2024-2025 on Clarity. Pre-2024
+    # is HTML-based on a different subdomain; deferred.
+    ClaritySummaryJsonSource(
+        name="2024 Delaware Primary", year=2024, category="Primaries", is_primary=True,
+        coverage_note="Delaware County (Media + boroughs + townships)",
+        url=_CLARITY_BASE + "Delaware/120839/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2024 Delaware General", year=2024, category="Generals",
+        coverage_note="Delaware County (Media + boroughs + townships)",
+        url=_CLARITY_BASE + "Delaware/122488/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2025 Delaware Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Delaware County (Media + boroughs + townships)",
+        url=_CLARITY_BASE + "Delaware/123824/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2025 Delaware General", year=2025, category="Generals",
+        coverage_note="Delaware County (Media + boroughs + townships)",
+        url=_CLARITY_BASE + "Delaware/125145/",
+    ),
+]
+
+
+# Berks County (mixed lean — Reading is D, surrounding county R) publishes
+# PDF-only results going back to 2003. We extract via Claude (LlmPdfSource);
+# results are cached to .cache/llm/ so reruns are free.
+
+_BERKS_PDF_BASE = "https://www.berkspa.gov/getmedia/"
+
+BERKS_LLM_SOURCES: list[ElectionSource] = [
+    LlmPdfSource(
+        name="2021 Berks Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Berks County (Reading + boroughs + townships)",
+        url=_BERKS_PDF_BASE + "fc57798a-da9a-444c-ae2f-e44ed386ffce/"
+            "Official-Results-State-wide-06-10-2021.pdf",
+    ),
+    LlmPdfSource(
+        name="2023 Berks Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Berks County (Reading + boroughs + townships)",
+        url=_BERKS_PDF_BASE + "bd209dc6-bd5c-431c-9072-1abf4e337e94/"
+            "PE23-General-Summary-6-28.pdf",
+    ),
+    LlmPdfSource(
+        name="2025 Berks Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Berks County (Reading + boroughs + townships)",
+        url=_BERKS_PDF_BASE + "d3291f1d-85d9-4ab8-9447-2cffa3f29b4d/"
+            "Official-Summary-6-6-2025.pdf",
+    ),
+]
+
+
 # Federal/statewide contests to exclude when running the Allegheny LOCAL
 # workbook. Kept inclusive — both the modern "Justice of the X Court" naming
 # and the older "Judge of the X Court" form, plus office variants.
@@ -871,3 +1207,20 @@ if __name__ == "__main__":
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
     print(f"Saved 2025 PA local workbook to '{pa_local_out}'")
+
+    # --- Mid-sized counties: York + Delaware (Clarity) + Berks (LLM-extracted PDF) ---
+    # Bipartisan coverage: York R-leaning, Delaware D-leaning, Berks mixed.
+    # Berks sources are LLM-extracted from PDFs via the Anthropic SDK — they
+    # only run when ANTHROPIC_API_KEY is set; otherwise we skip them so the
+    # script doesn't fail. Cache makes subsequent runs free.
+    mid_sources: list[ElectionSource] = list(CLARITY_PA_SOURCES)
+    if os.environ.get('ANTHROPIC_API_KEY'):
+        mid_sources += BERKS_LLM_SOURCES
+    else:
+        print("(Skipping Berks LLM sources — set ANTHROPIC_API_KEY to enable.)")
+    mid_out = "Pennsylvania_NonMajority_MidCounties.xlsx"
+    write_workbook_pooled_by_category(
+        mid_sources, mid_out,
+        race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
+    )
+    print(f"Saved mid-counties workbook to '{mid_out}'")

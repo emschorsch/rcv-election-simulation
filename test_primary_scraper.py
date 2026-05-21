@@ -9,6 +9,8 @@ import pytest
 
 from primary_scraper import (
     _filter_oe_listing,
+    _llm_rows_to_tidy,
+    _parse_clarity_summary_json,
     _parse_openelections_df,
     _parse_wprdc_summary_df,
     _strip_middle_initials,
@@ -867,3 +869,129 @@ def test_wprdc_aggregates_duplicate_candidate_rows_within_race():
     out = _parse_wprdc_summary_df(df, is_primary=False)
     assert out['Candidate'].tolist() == ['ALICE']
     assert out['Votes'].tolist() == [100.0]
+
+
+# --- _parse_clarity_summary_json -------------------------------------------
+
+def _clarity_contest(cat, c, ch, v, p=None, vf=1):
+    return {
+        'CAT': cat, 'C': c, 'CH': ch, 'V': v, 'VF': vf,
+        'P': p if p is not None else [''] * len(ch),
+    }
+
+
+def test_clarity_general_contest_keeps_bare_race_name():
+    data = [_clarity_contest('Pennsylvania', 'Mayor of Media', ['Alice', 'Bob'], [100, 50])]
+    out = _parse_clarity_summary_json(data, is_primary=False)
+    assert out['Race_Name'].tolist() == ['Mayor of Media', 'Mayor of Media']
+    assert set(out['Candidate']) == {'ALICE', 'BOB'}
+
+
+def test_clarity_primary_prepends_party_from_cat():
+    # CAT="Democratic" should become "DEM " prefix when is_primary=True.
+    data = [_clarity_contest('Democratic', 'Council Member', ['Alice'], [100])]
+    out = _parse_clarity_summary_json(data, is_primary=True)
+    assert out['Race_Name'].tolist() == ['DEM Council Member']
+
+
+def test_clarity_primary_does_not_double_prefix_when_contest_already_has_party():
+    # Some Clarity files already include the party in the contest name itself
+    # (the "(DEM)" parenthetical) AND in CAT. After stripping the paren we'd
+    # double-prefix without the already-prefixed check.
+    data = [_clarity_contest('Democratic', 'DEM Council Member', ['Alice'], [100])]
+    out = _parse_clarity_summary_json(data, is_primary=True)
+    assert out['Race_Name'].tolist() == ['DEM Council Member']
+
+
+def test_clarity_drops_multi_seat_contests():
+    data = [
+        _clarity_contest('Democratic', 'Single Seat Race', ['Alice'], [100], vf=1),
+        _clarity_contest('Democratic', 'Two Seat Race', ['Alice', 'Bob'], [100, 80], vf=2),
+    ]
+    out = _parse_clarity_summary_json(data, is_primary=True)
+    assert set(out['Race_Name']) == {'DEM Single Seat Race'}
+
+
+def test_clarity_strips_trailing_party_paren_from_contest_name():
+    # Real Clarity output: contest names look like "Mayor of Media (DEM)" —
+    # the parenthetical is a duplicate of CAT and clutters the race name.
+    data = [_clarity_contest('Democratic', 'Mayor of Media (DEM)', ['Alice'], [100])]
+    out = _parse_clarity_summary_json(data, is_primary=True)
+    assert out['Race_Name'].tolist() == ['DEM Mayor of Media']
+
+
+def test_clarity_drops_write_in_aggregate_choice():
+    # Clarity often emits a "Write-In (Total)" choice as the aggregate write-in
+    # count. After _normalize_candidate strips the paren, it becomes
+    # "WRITE-IN TOTAL" — which isn't in our drop list. But the plain
+    # "Write-Ins" / "Write-In" variants ARE dropped. Test the plain case here.
+    data = [_clarity_contest('Democratic', 'Mayor', ['Alice', 'Write-In'], [100, 5])]
+    out = _parse_clarity_summary_json(data, is_primary=True)
+    assert out['Candidate'].tolist() == ['ALICE']
+
+
+def test_clarity_empty_input_returns_empty_frame():
+    out = _parse_clarity_summary_json([], is_primary=False)
+    assert len(out) == 0
+    assert list(out.columns) == ['Candidate', 'Race_Name', 'Votes']
+
+
+# --- _llm_rows_to_tidy -----------------------------------------------------
+
+def test_llm_rows_to_tidy_round_trip_general():
+    rows = [
+        {'contest_name': 'Mayor of Reading', 'candidate': 'Eddie Moran',
+         'party': 'DEM', 'votes': 5000},
+        {'contest_name': 'Mayor of Reading', 'candidate': 'Other Person',
+         'party': 'REP', 'votes': 3000},
+    ]
+    out = _llm_rows_to_tidy(rows, is_primary=False)
+    assert set(out['Race_Name']) == {'Mayor of Reading'}
+    assert set(out['Candidate']) == {'EDDIE MORAN', 'OTHER PERSON'}
+    assert sorted(out['Votes'].tolist()) == [3000.0, 5000.0]
+
+
+def test_llm_rows_to_tidy_prepends_party_to_primary_when_missing():
+    # LLM forgot to prefix the primary contest name. Should be added from
+    # the `party` field — same safety net the WPRDC parser applies.
+    rows = [
+        {'contest_name': 'Mayor of Reading', 'candidate': 'Eddie Moran',
+         'party': 'DEM', 'votes': 5000},
+        {'contest_name': 'Mayor of Reading', 'candidate': 'Mary Smith',
+         'party': 'REP', 'votes': 3000},
+    ]
+    out = _llm_rows_to_tidy(rows, is_primary=True)
+    assert set(out['Race_Name']) == {'DEM Mayor of Reading', 'REP Mayor of Reading'}
+
+
+def test_llm_rows_to_tidy_drops_meta_rows_if_llm_included_them():
+    rows = [
+        {'contest_name': 'Mayor', 'candidate': 'Real Person',
+         'party': 'DEM', 'votes': 100},
+        {'contest_name': 'Mayor', 'candidate': 'Over Votes',
+         'party': '', 'votes': 5},
+        {'contest_name': 'Mayor', 'candidate': 'Write-Ins',
+         'party': '', 'votes': 2},
+    ]
+    out = _llm_rows_to_tidy(rows, is_primary=False)
+    assert out['Candidate'].tolist() == ['REAL PERSON']
+
+
+def test_llm_rows_to_tidy_applies_candidate_normalization():
+    # Same chain as OE: uppercase, periods stripped, middle initials dropped,
+    # party suffix stripped. All variants below should collapse to one row.
+    rows = [
+        {'contest_name': 'Mayor', 'candidate': 'Ryan E. Mackenzie',
+         'party': 'REP', 'votes': 100},
+        {'contest_name': 'Mayor', 'candidate': 'RYAN MACKENZIE REP',
+         'party': 'REP', 'votes': 50},
+    ]
+    out = _llm_rows_to_tidy(rows, is_primary=False)
+    assert out['Candidate'].tolist() == ['RYAN MACKENZIE']
+    assert out['Votes'].tolist() == [150.0]
+
+
+def test_llm_rows_to_tidy_empty_input_returns_empty_frame():
+    out = _llm_rows_to_tidy([], is_primary=False)
+    assert len(out) == 0
+    assert list(out.columns) == ['Candidate', 'Race_Name', 'Votes']

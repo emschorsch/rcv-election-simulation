@@ -36,8 +36,9 @@ Adding a new election source is one new class + one entry in a hardcoded source 
 | OpenElections PA (`<year>/*.csv` at root) | 2018 / 2020 / 2024 PA general | Federal + state offices statewide | ✅ Integrated as `OpenElectionsCsvSource`. |
 | OpenElections PA (`<year>/counties/*.csv`) | 2020 primary (48/67), 2022 general (24/67), 2024 primary (10/67), **2025 general (67/67)** | Statewide if you stitch; partial in many years | ✅ Integrated as `StitchedOpenElectionsCountiesSource`. |
 | WPRDC (`data.wprdc.org`) | Allegheny County 2012–2025, every primary + general | Pre-aggregated to county totals, includes **local races** | ✅ Integrated as `WprdcCsvSource` for 2017+. |
-| Lehigh / Bucks / Chester / Delaware / Montgomery county portals | Variable | Local races for each county | ❌ Deferred — PDF-only. Each county is a custom parser. |
-| Clarity Elections platform | Allegheny + handful of others | Mid-sized counties' results in CSV | ❌ Ruled out — too few PA counties use it; no public registry. |
+| **Clarity Elections** (`results.enr.clarityelections.com`) | **York 2023–2025, Delaware 2024–2025** | JSON-API for mid-size county results, summary endpoint pre-aggregated | ✅ Integrated as `ClaritySummaryJsonSource`. CloudFront requires browser User-Agent. |
+| **Berks County PDFs** (`berkspa.gov/getmedia/`) | **Berks primaries 2003–2025** | Reading + surrounding boroughs and townships | ✅ Source class built (`LlmPdfSource` w/ Claude tool_use extraction + disk cache); registry for 2021/2023/2025 primaries. Gated on `ANTHROPIC_API_KEY` at runtime. |
+| Lehigh / Bucks / Chester / Montgomery county portals | Variable | Local races for each county | ❌ Deferred — PDF-only, would need per-county work. Could be added via `LlmPdfSource` later. |
 | PA Department of State (`electionreturns.pa.gov`) | All 67 counties statewide | Federal/state races only, not local | ❌ Not pursued — duplicates OE statewide coverage; doesn't add local. |
 | OpenElections PA pre-2018 | 2000–2016 fixed-width files | Older races | ❌ Deferred — different schema; would need new parser. |
 
@@ -49,11 +50,12 @@ We made these choices in roughly the order shown above. The progression was:
 2. **OpenElections second** because it's the obvious "give me PA data" source. The schema is the same across years, so one parser handles 2018+. Coverage is uneven (some years have state rollups, others need stitching from per-county files), so we added the stitching source.
 3. **WPRDC third** for Allegheny because the user wanted local races and Allegheny is the second-largest PA jurisdiction with the cleanest data hub outside Philly.
 4. **OpenElections 2025 county files fourth** — discovered late in the session that OE has now done the per-county PDF/Excel parsing work for the entire state for 2025, producing tidy CSVs we could ingest with our existing parser. This was the highest-leverage addition: one new source unlocks all 67 PA counties for 2025 local races.
+5. **Clarity Elections fifth (York + Delaware)** — when the user asked to broaden coverage across PA counties, we revisited Clarity. The user provided URLs for several mid-size counties, which lets us pick known-Clarity instances directly without needing a discovery API. York and Delaware together give two different mid-size county profiles with strong competitive races in both major-party primaries. CloudFront blocks plain `curl` so we send a Safari User-Agent on every request.
+6. **Berks LLM-extracted PDFs sixth** — Berks publishes PDF-only results back to 2003. Rather than write a Berks-specific PDF parser, we built a generic `LlmPdfSource` that sends the PDF to Claude with a tool_use schema for structured extraction. Results are cached to `.cache/llm/` so first extraction costs ~$1/PDF and reruns are free. The class is built and tested; live extraction is gated on `ANTHROPIC_API_KEY` so the script doesn't fail when the key isn't set.
 
 ### Why we ruled out the alternatives
 
-- **Clarity Elections**: We initially thought this would be a broad parser (one parser → many PA counties). Investigation showed only Allegheny + a small handful of mid-sized counties use it, and Clarity URLs are per-election numeric IDs with no discovery endpoint. Plus, we already cover Allegheny via WPRDC. Net: low payoff.
-- **PDF parsing for Bucks/Lehigh/Delaware/Montgomery**: Each county's PDF layout is different. OpenElections itself maintains 49 county-specific parser scripts to handle PA. That work has been done — we get it for free for 2025 via their `counties/` directory. Doing it ourselves for older years would be substantial effort with low expected yield.
+- **PDF parsing for Bucks/Lehigh/Chester/Montgomery**: Each county's PDF layout is different. OpenElections itself maintains 49 county-specific parser scripts to handle PA. That work has been done — we get it for free for 2025 via their `counties/` directory. Once `LlmPdfSource` is proven on Berks, the same class can be pointed at other counties' PDFs.
 - **State portal (`electionreturns.pa.gov`)**: Doesn't have local races; only adds noise relative to OE which we already use.
 
 ## Output workbooks
@@ -64,6 +66,7 @@ We made these choices in roughly the order shown above. The progression was:
 | `Pennsylvania_NonMajority_2018plus.xlsx` | OpenElections | Two pooled sheets (Primaries, Generals) | PA federal + state, 2018–2024 |
 | `Allegheny_NonMajority_Local.xlsx` | WPRDC | Two pooled sheets (Primaries, Generals) | Allegheny County local races, 2017–2025 |
 | `Pennsylvania_NonMajority_Local2025.xlsx` | OpenElections `2025/counties/` | One pooled sheet (Generals) | All 67 PA counties local races, 2025 only |
+| `Pennsylvania_NonMajority_MidCounties.xlsx` | Clarity (York/Delaware) + Berks PDFs via Claude | Two pooled sheets (Primaries, Generals) | York 2023–2025, Delaware 2024–2025; Berks 2021/2023/2025 when API key is set |
 
 The output files are gitignored. They're regenerated by running `python primary_scraper.py`.
 
@@ -139,6 +142,30 @@ Stitched sources can have partial county coverage (e.g., OE 2022 PA general has 
 
 **Fix**: every output row carries a `Coverage` column showing `"24 of 67 counties (stitched)"`. The number is derived from the data (number of distinct counties in the fetched frame), not hardcoded — so misrepresentations like "67/67 (state rollup)" can't slip in when the rollup file is actually partial. (Discovered: the 2020 PA general "county rollup" file is only 13/67. Switched to the precinct file which is 67/67.)
 
+### 10. CloudFront User-Agent blocking (Clarity)
+
+Surfaced when probing Clarity Elections endpoints: `curl` and the bare `urllib.request` UA get a `403 Forbidden` from CloudFront. The data itself is public, but the front-end blocks anything that looks like a bot.
+
+**Fix**: `ClaritySummaryJsonSource` sets `User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15` on every request. The header is stored as a class attribute so it can be overridden per-instance if a Clarity URL ever needs something different.
+
+### 11. Write-in variant proliferation
+
+After integrating Clarity, the workbook revealed many more write-in spellings the existing literal set didn't catch: `WRITE-IN (TOTAL)` (Clarity's preferred form, with the parenthetical), `UNASSIGNED WRITE-INS` (Delaware), `UNRESOLVED WRITE-IN` and `WRITE-IN: SCATTERED` (Allegheny WPRDC). The literal set was getting unwieldy and missing variants.
+
+**Fix**: replaced the literal `~candidate.isin(_NON_CANDIDATE_NAMES)` check with a helper `_is_non_candidate()` that combines the small literal set (`OVER VOTES`, `UNDER VOTES`, `NOT ASSIGNED`, `SCATTERED`) with a regex `WRITE.?IN` that catches every write-in variant in one rule. Real candidate names should never contain the substring `WRITE-IN` (or `WRITE IN`/`WRITEIN`), so the regex is safe.
+
+### 12. Clarity row-ID candidate prefixes (Delaware)
+
+Delaware's Clarity export prefixes candidate names with a numeric row ID: `"(112) MIKE HIGGINS"`, `"(82) MIKE JOHNSON"`. Cross-filed candidates (e.g., a magistrate running on both DEM and REP lines) get *different* row IDs and would otherwise appear as two separate "candidates".
+
+**Fix**: added `_CANDIDATE_ID_PREFIX_RE = r'^\(\d+\)\s*'` to `_normalize_candidate`. Strips the prefix early so the same person collapses to one row regardless of which party line they appeared on.
+
+### 13. Removing write-ins changes majority math
+
+After tightening the write-in filter, some races that previously looked non-majority (e.g., 49.8% vs 49.5% vs 0.7% write-ins) flipped to majority once write-ins were dropped (49.8/99.3 ≈ 50.15%). This is actually the correct IRV interpretation — under IRV, eliminated write-ins don't transfer further, so the remaining candidates compete for the reduced pool. The previously-surfaced 50/50 Delaware races correctly disappeared.
+
+**Note**: this changed a few Allegheny/2025-PA counts as a side effect. Comparing before/after, no real RCV-relevant race was lost — only races where the "non-majority" classification was an artifact of including write-in inflation in the denominator.
+
 ## Filtering thresholds and rationale
 
 | Filter | Default | Why |
@@ -165,30 +192,45 @@ Selection of races that came out of the cleanup as genuine RCV-relevant cases:
 - 2017 Mt. Lebanon School Director DEM: 7-way, leader at 27.2%
 
 **All-PA 2025 local (`Pennsylvania_NonMajority_Local2025.xlsx`)**
-- 1,154 non-majority races across 67 counties
+- ~1,140 non-majority races across 67 counties
 - Multiple exact 50/50 ties (Auditor Springfield, McConnellsburg Council, Commissioner East Deer Ward 2)
 - Many 50.0/49.x school director and council races
+
+**Mid-counties (`Pennsylvania_NonMajority_MidCounties.xlsx`)**
+- 2023 York REP Magisterial District Judge 19-3-09: 4-way (Spadaccino 44.5%, Farren 28.3%, Dehart 22.2%, Ruth 5.0%)
+- 2023 York REP Township Supervisor Newberry Township: 41.1 / 40.3 / 18.6 — razor-thin race with a third-candidate splitter
+- 2023 York REP Township Supervisor West Manheim: 4-way (Hoffman 49.2%, Franks 23.8%, Staaf 14.6%, OConnor 12.5%)
+- 2023 York REP Magisterial District Judge 19-2-03: 48.9% / 38.6% / 12.6%
+- 2025 York REP Codorus Township Supervisor: Gross 49.7% / Maxwell 39.8% / Bupp 10.1%
+- 2025 Delaware DEM Chester Twp Auditor: 34.0% / 33.3% / 32.7% — essentially a 3-way tie
+
+The York and Delaware sources together provide non-majority races across both major-party primaries.
 
 ## Out of scope (deferred)
 
 Items we considered and did not pursue, with the reason:
 
 - **2018 PA primary in OpenElections**: only the legacy fixed-width file exists. Would need a separate parser. Low payoff for one year.
-- **Pre-2025 odd-year PA data outside Allegheny**: OpenElections doesn't have 2017/2019/2021/2023 PA municipal cycle data. Each county would be a custom integration. Substantial work; current scope (Allegheny + 2025 statewide) covers most of the interesting cases.
-- **PDF parsing for Bucks/Lehigh/Delaware/Montgomery**: PDFs vary per county. OpenElections' 2025 county CSVs already cover all of them for 2025. For earlier years, the cost-per-county is high.
+- **Pre-2025 odd-year PA data outside Allegheny + York/Delaware**: OpenElections doesn't have 2017/2019/2021/2023 PA municipal cycle data. Each remaining county would be a custom integration. With `LlmPdfSource` proven on Berks, additional counties become tractable: one new registry entry per county PDF.
+- **Live Berks LLM extraction**: source class + registry built and unit-tested, but the live API path is gated on `ANTHROPIC_API_KEY` being set in the env. When the key is available, the script picks up the Berks sources automatically (no code change). Estimated ~$1/PDF, $3 total for the current 3 PDFs, $0 thereafter due to disk cache.
+- **Lancaster 2017–2023**: data is in an interactive HTML portal (no file download), would need scraping.
+- **Pre-2023 Delaware**: hosted on `election.co.delaware.pa.us` HTML pages, separate scraper.
+- **Pre-2023 York**: PDFs on the county's DocumentCenter — drop-in target for `LlmPdfSource` once enabled.
+- **Bucks, Lehigh, Montgomery, Dauphin, Cumberland**: all PDF-based; same pattern as Berks. Add via `LlmPdfSource` registry entries.
 - **Renaming `primary_scraper.py`** to something more accurate like `rcv_finder.py`: cosmetic; defer.
-- **Caching downloaded files between runs**: not needed at current scale.
+- **Caching downloaded files between runs**: only LLM responses are cached (`.cache/llm/`); CSV/JSON downloads are cheap enough to refetch.
 - **CLI / argparse**: would be nice; not needed — the bottom of the file is editable in seconds.
 - **Splitting into a package**: not needed at current scale.
 - **Cross-jurisdiction summary sheet**: a single "top-100 PA non-majority races" view across all workbooks would be useful but the user hasn't asked for it.
-- **Merging Allegheny + PA 2025 workbooks**: would create some overlap (Allegheny appears in both) but a consolidated view might be more useful for browsing. Defer until asked.
+- **Merging Allegheny + PA 2025 + MidCounties workbooks**: would create some overlap. Defer until asked.
 
 ## Repository state at time of writing
 
-- `primary_scraper.py` — single-file pipeline (~750 lines).
-- `test_primary_scraper.py` — 74 unit tests, all pure functions, runs in <1s.
-- `.gitignore` — excludes generated workbooks, pytest cache, IDE configs.
-- 4 output workbooks generated by running the script.
+- `primary_scraper.py` — single-file pipeline (~1150 lines).
+- `test_primary_scraper.py` — 86 unit tests, all pure functions, runs in <1s.
+- `.gitignore` — excludes generated workbooks, pytest cache, IDE configs, and `.cache/` (LLM response cache).
+- 5 output workbooks generated by running the script (Philly, PA statewide, Allegheny local, 2025 PA all-counties local, mid-counties Clarity+LLM).
+- New dependency: `anthropic` Python SDK (required only when running Berks LLM extraction).
 
 ## If we were starting over
 
