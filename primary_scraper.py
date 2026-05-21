@@ -175,6 +175,8 @@ _NON_CANDIDATE_NAMES = frozenset({
     'OVER VOTES', 'UNDER VOTES', 'OVERVOTES', 'UNDERVOTES',
     'NOT ASSIGNED', 'SCATTERED',
     'TOTAL VOTES CAST',  # Chester Electionware footer per contest
+    'CONTEST TOTALS',    # Mercer / Northumberland: total ballots cast in the contest
+    'TIMES BLANK VOTED', 'TIMES OVER VOTED', 'TIMES UNDER VOTED',  # Electionware stat rows
 })
 
 # Anything matching this is treated as a write-in aggregate/variant and
@@ -1292,6 +1294,8 @@ _CHESCO_PDF_BASE = "https://www.chesco.org/DocumentCenter/View/"
 _NORCO_PDF_BASE = "https://www.norcopa.gov/corecode/uploads/document6/uploaded_pdfs/corecode/"
 _CENTRE_PDF_BASE = "https://centrecountypa.gov/DocumentCenter/View/"
 _LEBCO_PDF_BASE = "https://www.lebanoncountypa.gov/getmedia/"
+_MERCER_PDF_BASE = "https://www.mercercountypa.gov/election/Election.Results/"
+_NUMCO_PDF_BASE = "https://www.northumberlandcountypa.gov/htdocs/wp-content/uploads/documents/elections/"
 
 # 2021 Berks isn't here: their 2021 "Grand Totals" PDF is statewide-only
 # (judges + ballot questions, 5 pages, no local contests), and the
@@ -1371,6 +1375,41 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         coverage_note="Lebanon County (City of Lebanon + boroughs + townships)",
         url=_LEBCO_PDF_BASE + "f21ac1fe-65c2-4f9d-a5da-50d957ca0961/"
             "Summary-Results-V4_With_Provos.pdf",
+    ),
+    # Mercer County (Mercer + Sharon + Hermitage + townships). Clean
+    # `Election.Results/<YEAR>/PRIMARY/SUMMARY.pdf` URL pattern.
+    ElectionwarePdfSource(
+        name="2021 Mercer Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Mercer County (Mercer + Sharon + Hermitage + townships)",
+        url=_MERCER_PDF_BASE + "2021/PRIMARY/SUMMARY.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Mercer Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Mercer County (Mercer + Sharon + Hermitage + townships)",
+        url=_MERCER_PDF_BASE + "2023/PRIMARY/SUMMARY.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Mercer Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Mercer County (Mercer + Sharon + Hermitage + townships)",
+        url=_MERCER_PDF_BASE + "2025/PRIMARY/SUMMARY.pdf",
+    ),
+    # Northumberland County (Sunbury + Shamokin + boroughs/townships).
+    # `documents/elections/<YYYY>_<MMDD>_official/overall.pdf` pattern;
+    # 2021's filename is capitalized differently ("Overall-Official.pdf").
+    ElectionwarePdfSource(
+        name="2021 Northumberland Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Northumberland County (Sunbury + Shamokin + boroughs)",
+        url=_NUMCO_PDF_BASE + "2021_0518_official/Overall-Official.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Northumberland Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Northumberland County (Sunbury + Shamokin + boroughs)",
+        url=_NUMCO_PDF_BASE + "2023_0516_official/overall.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Northumberland Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Northumberland County (Sunbury + Shamokin + boroughs)",
+        url=_NUMCO_PDF_BASE + "2025_0520_official/overall.pdf",
     ),
 ]
 

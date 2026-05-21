@@ -37,7 +37,7 @@ Adding a new election source is one new class + one entry in a hardcoded source 
 | OpenElections PA (`<year>/counties/*.csv`) | 2020 primary (48/67), 2022 general (24/67), 2024 primary (10/67), **2025 general (67/67)** | Statewide if you stitch; partial in many years | ✅ Integrated as `StitchedOpenElectionsCountiesSource`. |
 | WPRDC (`data.wprdc.org`) | Allegheny County 2012–2025, every primary + general | Pre-aggregated to county totals, includes **local races** | ✅ Integrated as `WprdcCsvSource` for 2017+. |
 | **Clarity Elections** (`results.enr.clarityelections.com`) | **York 2023–2025, Delaware 2024–2025** | JSON-API for mid-size county results, summary endpoint pre-aggregated | ✅ Integrated as `ClaritySummaryJsonSource`. CloudFront requires browser User-Agent. |
-| **Electionware PDFs** (`berkspa.gov`, `chesco.org`, `norcopa.gov`, `centrecountypa.gov`, `lebanoncountypa.gov`, …) | **Berks 2023/2025, Chester 2021/2023/2025, Northampton 2021/2023/2025, Centre 2025, Lebanon 2021/2025** | Reading, West Chester, Bethlehem/Easton, State College, City of Lebanon + their surrounding municipalities. Same vendor format ≈ many other PA counties available with one-line additions. | ✅ Integrated as `ElectionwarePdfSource` (pdfplumber + regex, no API key needed). `LlmPdfSource` retained as an alternative for novel PDF layouts. |
+| **Electionware PDFs** (multiple county sites) | **Berks 2023/2025; Chester, Northampton 2021/2023/2025; Centre 2025; Lebanon 2021/2025; Mercer 2021/2023/2025; Northumberland 2021/2023/2025** | Reading, West Chester, Bethlehem/Easton, State College, City of Lebanon, Mercer/Sharon/Hermitage, Sunbury/Shamokin + surrounding municipalities. Same vendor format = many more PA counties addable as one-line registry entries (Snyder, Schuylkill, Indiana confirmed Electionware via OE parser docstrings but PDF URLs need more drilling). | ✅ Integrated as `ElectionwarePdfSource` (pdfplumber + regex, no API key needed). `LlmPdfSource` retained as an alternative for novel PDF layouts. Note: Lycoming and Bedford turned out to use *different* PDF vendors. |
 | Lehigh / Bucks / Chester / Montgomery county portals | Variable | Local races for each county | ❌ Deferred — PDF-only, would need per-county work. Could be added via `LlmPdfSource` later. |
 | PA Department of State (`electionreturns.pa.gov`) | All 67 counties statewide | Federal/state races only, not local | ❌ Not pursued — duplicates OE statewide coverage; doesn't add local. |
 | OpenElections PA pre-2018 | 2000–2016 fixed-width files | Older races | ❌ Deferred — different schema; would need new parser. |
@@ -229,7 +229,13 @@ Selection of races that came out of the cleanup as genuine RCV-relevant cases:
 - 2023 Northampton REP Commissioner Bethlehem Twsp 1st Ward: 46.2% / 45.9% / 7.9% — extremely close 2-way with a spoiler
 - 2025 Northampton REP Judge of the Court of Common Pleas: Fuller 47.2% / Clark 34.0% / Eyer 18.8%
 - 2025 Northampton DEM School Director Northampton Area Region III: Flamisch 47.1% / Gogel 32.9% / Marchiano 20.0%
-- 2021 Lebanon DEM Magisterial District Judge 52-2-01: 4-way at 40.0 / 31.8 / 18.3 / 9.9 — and a cross-filed REP counterpart (Capello 37.1 / Itzen 32.8 / Maguire 17.9 / Magaro 8.8) for the same district. The pattern of competitive primaries on both party lines for one magisterial-judge seat keeps recurring across counties (also seen in 2023 Chester District 15-3-06 and 2021/2025 Northampton District 03-2-09).
+- 2021 Lebanon DEM Magisterial District Judge 52-2-01: 4-way at 40.0 / 31.8 / 18.3 / 9.9 — and a cross-filed REP counterpart (Capello 37.1 / Itzen 32.8 / Maguire 17.9 / Magaro 8.8) for the same district.
+- 2021 Mercer DEM Judge of the Court of Common Pleas: 42.8 / 29.9 / 27.3 — and a cross-filed REP counterpart (McEwen 41.7 / McConnell Jr 40.8 / Joanow 17.5) with the same three candidates in different rank order.
+- 2021 Mercer DEM/REP Magisterial District Judge 35-03-02: same three candidates (Straub / Osborne / Gerwick) on both party lines, both non-majority.
+- 2023 Northumberland REP Council Region 2: Hetherington 41.4 / Walker 29.7 / Pfeil 28.9.
+- 2023 Northumberland REP Supervisor Delaware Twp: Smith 45.4 / Hertzler 38.9 / Heater 15.6.
+
+The cross-filed Magistrate/Judge of the Court of Common Pleas pattern keeps recurring across counties: same candidates compete in both party primaries because PA judicial candidates can file in both. It's now visible in Chester (2023 District 15-3-06), Northampton (2021 District 03-2-09), Lebanon (2021 District 52-2-01), and Mercer (2021 District 35-03-02 + Court of Common Pleas). When neither party clears 50% with these crowded fields, RCV would be especially decisive.
 
 ## Out of scope (deferred)
 
