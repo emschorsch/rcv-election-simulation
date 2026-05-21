@@ -174,6 +174,7 @@ _PARTY_SUFFIX_RE = re.compile(r'\s+(?:' + '|'.join(_PARTY_CODES) + r')\s*$')
 _NON_CANDIDATE_NAMES = frozenset({
     'OVER VOTES', 'UNDER VOTES', 'OVERVOTES', 'UNDERVOTES',
     'NOT ASSIGNED', 'SCATTERED',
+    'TOTAL VOTES CAST',  # Chester Electionware footer per contest
 })
 
 # Anything matching this is treated as a write-in aggregate/variant and
@@ -762,17 +763,30 @@ class LlmPdfSource(ElectionSource):
 # machine to walk the page text, anchoring on each "Vote For N" line.
 
 _ELECTIONWARE_VOTE_FOR_RE = re.compile(r'^\s*Vote For\s+(\d+)\s*$')
-_ELECTIONWARE_HEADER_TOKENS = frozenset(
-    {'Election', 'TOTAL', 'Day', 'Mail', 'Provisional'}
-)
-# Candidate row: indented name, two-or-more spaces, then 1-5 columns of numbers
-# (with optional commas). The first captured number is TOTAL — we ignore the
-# rest (Election Day / Mail / Provisional / Military). 2021 Berks PDFs have
-# only a TOTAL column; 2023/2025 have four. Non-greedy name match plus the
-# end-of-line anchor lets us locate the boundary correctly even for names
-# containing commas like "Dante Santoni, Jr.".
+# Header tokens (case-insensitive). Covers every variant we've seen across PA
+# Electionware-published PDFs: Berks uses {Election, TOTAL, Day, Mail,
+# Provisional}; Chester uses Election/TOTAL/Day/Absentee/Mail-In/Provisional;
+# some counties have Military columns. We compare lowercased tokens against
+# this set.
+_ELECTIONWARE_HEADER_TOKENS = frozenset({
+    'election', 'total', 'day', 'mail', 'provisional',
+    'mail-in', 'absentee', 'absentee/', 'absentee/mail-in',
+    'military', 'extra',
+})
+# Candidate row: indented name (no digits, no % signs — that constraint is
+# important; without it, `(.+?)` would happily swallow the percent column
+# from Chester-style PDFs and we'd capture the wrong number as TOTAL),
+# two-or-more spaces, then 1-6 columns of numbers (digits + commas + optional
+# % and . for the VOTE % column some counties include). The first captured
+# number is always TOTAL.
+#
+# Layouts encountered:
+#   Berks 2021: TOTAL only
+#   Berks 2023+: TOTAL, Election Day, Mail, Provisional
+#   Chester 2021: TOTAL, VOTE %, Election Day, Absentee/Mail-In, Provisional
+#   Chester 2023+: TOTAL, Election Day, Absentee/Mail-In, Provisional
 _ELECTIONWARE_CAND_RE = re.compile(
-    r'^\s+(.+?)\s{2,}([\d,]+)(?:\s+[\d,]+){0,4}\s*$'
+    r'^\s+([A-Za-z][^\d%]*?)\s{2,}([\d,]+)(?:\s+[\d,%.]+){0,5}\s*$'
 )
 
 
@@ -803,7 +817,7 @@ def _parse_electionware_lines(lines: list[str]) -> list[dict]:
             stripped = lines[j].strip()
             if not stripped:
                 continue
-            tokens = stripped.split()
+            tokens = stripped.lower().split()
             if tokens and all(t in _ELECTIONWARE_HEADER_TOKENS for t in tokens):
                 continue
             contest_name = stripped
@@ -1262,12 +1276,14 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
 ]
 
 
-# Berks County publishes PDF-only results going back to 2003. We extract
-# them with pdfplumber + a regex state machine in `ElectionwarePdfSource`
-# (no API key needed). The same Electionware format is used by many other
-# PA counties, so adding more is one new source registry entry each.
+# PA counties that publish their Summary Results PDF via the Electionware
+# vendor share a consistent format that `ElectionwarePdfSource` parses
+# with pdfplumber + regex (no API key needed). Many PA counties use
+# Electionware per OpenElections' parser scripts (Berks, Chester, Centre,
+# Bedford, Blair, Bradford, Carbon, Crawford, Elk, Franklin, etc.).
 
 _BERKS_PDF_BASE = "https://www.berkspa.gov/getmedia/"
+_CHESCO_PDF_BASE = "https://www.chesco.org/DocumentCenter/View/"
 
 # 2021 Berks isn't here: their 2021 "Grand Totals" PDF is statewide-only
 # (judges + ballot questions, 5 pages, no local contests), and the
@@ -1275,7 +1291,8 @@ _BERKS_PDF_BASE = "https://www.berkspa.gov/getmedia/"
 # which would need a precinct-aware parser. 2023+ Berks publishes a single
 # unified summary PDF that includes local contests at county totals.
 
-BERKS_PDF_SOURCES: list[ElectionSource] = [
+ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
+    # Berks County (Reading + surrounding boroughs/townships)
     ElectionwarePdfSource(
         name="2023 Berks Primary", year=2023, category="Primaries", is_primary=True,
         coverage_note="Berks County (Reading + boroughs + townships)",
@@ -1287,6 +1304,23 @@ BERKS_PDF_SOURCES: list[ElectionSource] = [
         coverage_note="Berks County (Reading + boroughs + townships)",
         url=_BERKS_PDF_BASE + "d3291f1d-85d9-4ab8-9447-2cffa3f29b4d/"
             "Official-Summary-6-6-2025.pdf",
+    ),
+    # Chester County (West Chester + boroughs/townships). 126-page Summary
+    # Results PDFs published at chesco.org/DocumentCenter.
+    ElectionwarePdfSource(
+        name="2021 Chester Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Chester County (West Chester + boroughs + townships)",
+        url=_CHESCO_PDF_BASE + "63375",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Chester Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Chester County (West Chester + boroughs + townships)",
+        url=_CHESCO_PDF_BASE + "72435",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Chester Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Chester County (West Chester + boroughs + townships)",
+        url=_CHESCO_PDF_BASE + "80017",
     ),
 ]
 
@@ -1348,10 +1382,10 @@ if __name__ == "__main__":
     )
     print(f"Saved 2025 PA local workbook to '{pa_local_out}'")
 
-    # --- Mid-sized counties: York + Delaware (Clarity JSON) + Berks (Electionware PDF) ---
+    # --- Mid-sized counties: York + Delaware (Clarity JSON), Berks + Chester (Electionware PDF) ---
     mid_out = "Pennsylvania_NonMajority_MidCounties.xlsx"
     write_workbook_pooled_by_category(
-        CLARITY_PA_SOURCES + BERKS_PDF_SOURCES, mid_out,
+        CLARITY_PA_SOURCES + ELECTIONWARE_PDF_SOURCES, mid_out,
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
     print(f"Saved mid-counties workbook to '{mid_out}'")

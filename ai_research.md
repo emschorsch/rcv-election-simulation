@@ -37,7 +37,7 @@ Adding a new election source is one new class + one entry in a hardcoded source 
 | OpenElections PA (`<year>/counties/*.csv`) | 2020 primary (48/67), 2022 general (24/67), 2024 primary (10/67), **2025 general (67/67)** | Statewide if you stitch; partial in many years | ✅ Integrated as `StitchedOpenElectionsCountiesSource`. |
 | WPRDC (`data.wprdc.org`) | Allegheny County 2012–2025, every primary + general | Pre-aggregated to county totals, includes **local races** | ✅ Integrated as `WprdcCsvSource` for 2017+. |
 | **Clarity Elections** (`results.enr.clarityelections.com`) | **York 2023–2025, Delaware 2024–2025** | JSON-API for mid-size county results, summary endpoint pre-aggregated | ✅ Integrated as `ClaritySummaryJsonSource`. CloudFront requires browser User-Agent. |
-| **Berks County PDFs** (`berkspa.gov/getmedia/`) | **Berks primaries 2003–2025** | Reading + surrounding boroughs and townships | ✅ Integrated as `ElectionwarePdfSource` (pdfplumber + regex, no API key needed). Registry for 2023/2025 primaries; 2021 is statewide-only summary so deferred. `LlmPdfSource` retained as an alternative for novel PDF layouts. |
+| **Electionware PDFs** (`berkspa.gov`, `chesco.org`, …) | **Berks 2023/2025, Chester 2021/2023/2025** | Berks: Reading + surrounding municipalities. Chester: West Chester + 230 precincts. Same vendor format ≈ many other PA counties available with one-line additions. | ✅ Integrated as `ElectionwarePdfSource` (pdfplumber + regex, no API key needed). `LlmPdfSource` retained as an alternative for novel PDF layouts. |
 | Lehigh / Bucks / Chester / Montgomery county portals | Variable | Local races for each county | ❌ Deferred — PDF-only, would need per-county work. Could be added via `LlmPdfSource` later. |
 | PA Department of State (`electionreturns.pa.gov`) | All 67 counties statewide | Federal/state races only, not local | ❌ Not pursued — duplicates OE statewide coverage; doesn't add local. |
 | OpenElections PA pre-2018 | 2000–2016 fixed-width files | Older races | ❌ Deferred — different schema; would need new parser. |
@@ -160,13 +160,19 @@ Delaware's Clarity export prefixes candidate names with a numeric row ID: `"(112
 
 **Fix**: added `_CANDIDATE_ID_PREFIX_RE = r'^\(\d+\)\s*'` to `_normalize_candidate`. Strips the prefix early so the same person collapses to one row regardless of which party line they appeared on.
 
-### 13. System Python SSL cert store sometimes lacks intermediate certs
+### 13. Electionware percent-column column-eating bug
+
+When extending the parser from Berks to Chester, we discovered Chester 2021 PDFs include a `VOTE %` column between TOTAL and Election Day (e.g., `"MARIA MCLAUGHLIN  42,302  99.33%  23,107  19,055   140"`). The original regex `(.+?)\s{2,}([\d,]+)…` greedily backtracked: it expanded the non-greedy name capture to include the actual total and the percent, then captured the Election Day count as "TOTAL". The result was ~5,800 corrupt candidate rows from one PDF.
+
+**Fix**: tightened the name capture to `[A-Za-z][^\d%]*?` (must start with a letter, may not contain digits or `%`). The first numeric column after the name is then unambiguously TOTAL. The trailing column class was widened to `[\d,%.]+` to accept the percent column harmlessly. Added a `test_electionware_handles_layout_with_percent_column` regression test so we don't backslide. Also added `TOTAL VOTES CAST` to `_NON_CANDIDATE_NAMES` to drop the per-contest totals row Chester emits.
+
+### 14. System Python SSL cert store sometimes lacks intermediate certs
 
 Surfaced when fetching PDFs directly from county sites (berkspa.gov): plain `urllib.request.urlopen` failed with `SSLCertVerificationError: unable to get local issuer certificate`, while the same `curl` and `pandas.read_csv` calls worked because they use bundled CA stores. The system Python's default trust store didn't accept the county's cert chain.
 
 **Fix**: `_extract_electionware_pdf` builds an `ssl.create_default_context(cafile=certifi.where())` and passes it to `urlopen`. `certifi` is already a transitive dep via `pandas`. Only applies to the PDF download path; other `urllib` calls (GitHub API) happen to work without it.
 
-### 14. Removing write-ins changes majority math
+### 15. Removing write-ins changes majority math
 
 After tightening the write-in filter, some races that previously looked non-majority (e.g., 49.8% vs 49.5% vs 0.7% write-ins) flipped to majority once write-ins were dropped (49.8/99.3 ≈ 50.15%). This is actually the correct IRV interpretation — under IRV, eliminated write-ins don't transfer further, so the remaining candidates compete for the reduced pool. The previously-surfaced 50/50 Delaware races correctly disappeared.
 
@@ -214,6 +220,9 @@ Selection of races that came out of the cleanup as genuine RCV-relevant cases:
 - 2025 Berks REP Judge of the Court of Common Pleas: Lehman 41.9% / Marks 39.1% / Taylor 18.9%
 - 2023 Berks REP Magisterial District Judge District 23-3-07: Book 42.6% / Dye 40.5% / Zimmerman 9.1% / Raup-Konsavage 7.8%
 - 2023 Berks DEM School Director Boyertown Area Region 1: 4-way (Arndt 31.2% / Sweisfort 25.8% / Neiman 19.2% / Scott 14.7%)
+- 2023 Chester DEM Magisterial District Judge District 15-3-06: 4-way (Hutton 36.7% / Colon 23.2% / McDermott 21.5% / Hashem 11.6%)
+- 2023 Chester REP Magisterial District Judge District 15-3-06: 4-way with the same Hashem/McDermott/Colon names (cross-filed) plus Tim Arndt 43.1%
+- 2025 Chester REP Township Supervisor West Caln: Mininger 43.1% / Martin 33.8% / Hutton 23.1%
 
 ## Out of scope (deferred)
 

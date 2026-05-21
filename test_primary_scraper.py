@@ -1115,3 +1115,29 @@ def test_electionware_walks_across_multiple_contests():
 def test_electionware_empty_input_returns_empty():
     assert _parse_electionware_lines([]) == []
     assert _parse_electionware_lines(['', '', 'random noise', '']) == []
+
+
+def test_electionware_handles_layout_with_percent_column():
+    # Chester 2021 PDFs have a `VOTE %` column between TOTAL and Election Day,
+    # so each candidate line includes a percent token (e.g., "99.33%") that
+    # must not be mistaken for part of the candidate name. Before tightening
+    # the regex (no digits/% in name), the parser was greedy-matching the
+    # percent into the name and capturing Election Day votes as TOTAL.
+    lines = [
+        "DEM JUSTICE OF THE SUPREME COURT",
+        "Vote For 1",
+        "                                        Election Absentee/",
+        "                       TOTAL   VOTE %                Provisional",
+        "                                         Day    Mail-In",
+        "  MARIA MCLAUGHLIN            42,302  99.33%  23,107  19,055   140",
+        "  Write-In Totals               286    0.67%   234      51      1",
+        "   Total Votes Cast            42,588  100.00% 23,341  19,106   141",
+    ]
+    rows = _parse_electionware_lines(lines)
+    # Only the real candidate row should yield extracted data; Write-In Totals
+    # and Total Votes Cast are emitted but downstream _is_non_candidate drops
+    # them. Critically: the captured TOTAL must be 42,302, not 23,107.
+    real = [r for r in rows if r['candidate'] == 'MARIA MCLAUGHLIN']
+    assert len(real) == 1
+    assert real[0]['votes'] == 42302
+    assert real[0]['contest_name'] == 'DEM JUSTICE OF THE SUPREME COURT'
