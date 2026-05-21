@@ -1291,6 +1291,7 @@ _BERKS_PDF_BASE = "https://www.berkspa.gov/getmedia/"
 _CHESCO_PDF_BASE = "https://www.chesco.org/DocumentCenter/View/"
 _NORCO_PDF_BASE = "https://www.norcopa.gov/corecode/uploads/document6/uploaded_pdfs/corecode/"
 _CENTRE_PDF_BASE = "https://centrecountypa.gov/DocumentCenter/View/"
+_LEBCO_PDF_BASE = "https://www.lebanoncountypa.gov/getmedia/"
 
 # 2021 Berks isn't here: their 2021 "Grand Totals" PDF is statewide-only
 # (judges + ballot questions, 5 pages, no local contests), and the
@@ -1354,6 +1355,22 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         name="2025 Centre Primary", year=2025, category="Primaries", is_primary=True,
         coverage_note="Centre County (State College + Bellefonte + townships)",
         url=_CENTRE_PDF_BASE + "31108/election-summary",
+    ),
+    # Lebanon County (City of Lebanon + boroughs + townships). 2023 is
+    # skipped — the only available 2023 file (`LandA-2023-Municipal.pdf`)
+    # is a Logic & Accuracy pre-election test run dated Sept 13 2023, not
+    # the actual May 2023 primary results.
+    ElectionwarePdfSource(
+        name="2021 Lebanon Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Lebanon County (City of Lebanon + boroughs + townships)",
+        url=_LEBCO_PDF_BASE + "8c6c067f-4cbe-4f62-b777-7819f1aba29e/"
+            "2021-Municipal-Primary-Election-Summary-Results.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Lebanon Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Lebanon County (City of Lebanon + boroughs + townships)",
+        url=_LEBCO_PDF_BASE + "f21ac1fe-65c2-4f9d-a5da-50d957ca0961/"
+            "Summary-Results-V4_With_Provos.pdf",
     ),
 ]
 
