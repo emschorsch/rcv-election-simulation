@@ -694,11 +694,12 @@ def _extract_pdf_via_claude(pdf_url: str, *, model: str = "claude-sonnet-4-6") -
     return rows
 
 
-def _llm_rows_to_tidy(rows: list[dict], *, is_primary: bool) -> pd.DataFrame:
-    """Convert raw LLM-extracted rows into the standard tidy frame.
+def _rows_to_tidy(rows: list[dict], *, is_primary: bool) -> pd.DataFrame:
+    """Convert a list of raw {contest_name, candidate, party, votes} dicts
+    (from any extractor — LLM, PDF, etc.) into the standard tidy frame.
 
     Applies the same candidate canonicalization and meta-row filtering used
-    elsewhere. If the LLM forgot to include a party prefix on a primary
+    elsewhere. If the source forgot to include a party prefix on a primary
     contest, prepend it from the row's `party` field — same conditional
     safety net as the WPRDC parser.
     """
@@ -741,7 +742,145 @@ class LlmPdfSource(ElectionSource):
     def fetch_tidy(self) -> pd.DataFrame:
         print(f"  extracting via Claude ({self.model})...")
         rows = _extract_pdf_via_claude(self.url, model=self.model)
-        return _llm_rows_to_tidy(rows, is_primary=self.is_primary)
+        return _rows_to_tidy(rows, is_primary=self.is_primary)
+
+
+# Electionware-PDF parsing (used by Berks, and applicable to many other PA
+# counties that publish results via Electionware). The Summary Results
+# Report has a highly consistent format:
+#
+#     <Contest header — possibly party-prefixed>
+#     Vote For N
+#                              Election
+#                     TOTAL    Day     Mail Provisional
+#     Candidate Name              <total>  <ed>  <mail>  <prov>
+#     ...
+#     Write-In Totals             <n>     <n>   <n>     <n>
+#      Not Assigned               <n>     <n>   <n>     <n>
+#
+# We use pdfplumber's layout-preserving text extraction and a small state
+# machine to walk the page text, anchoring on each "Vote For N" line.
+
+_ELECTIONWARE_VOTE_FOR_RE = re.compile(r'^\s*Vote For\s+(\d+)\s*$')
+_ELECTIONWARE_HEADER_TOKENS = frozenset(
+    {'Election', 'TOTAL', 'Day', 'Mail', 'Provisional'}
+)
+# Candidate row: indented name, two-or-more spaces, then 1-5 columns of numbers
+# (with optional commas). The first captured number is TOTAL — we ignore the
+# rest (Election Day / Mail / Provisional / Military). 2021 Berks PDFs have
+# only a TOTAL column; 2023/2025 have four. Non-greedy name match plus the
+# end-of-line anchor lets us locate the boundary correctly even for names
+# containing commas like "Dante Santoni, Jr.".
+_ELECTIONWARE_CAND_RE = re.compile(
+    r'^\s+(.+?)\s{2,}([\d,]+)(?:\s+[\d,]+){0,4}\s*$'
+)
+
+
+def _parse_electionware_lines(lines: list[str]) -> list[dict]:
+    """Parse Electionware-formatted PDF text lines into raw result rows.
+
+    Pure function — no I/O. Takes the layout-preserved line list and emits
+    a list of `{contest_name, candidate, votes}` dicts. Skips multi-seat
+    races (Vote For N>1) entirely. The downstream `_rows_to_tidy` handles
+    candidate canonicalization and meta-row filtering.
+    """
+    rows: list[dict] = []
+    i = 0
+    while i < len(lines):
+        m = _ELECTIONWARE_VOTE_FOR_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        vote_for_n = int(m.group(1))
+
+        # Walk backward (over blank lines and column-header lines) to find
+        # the contest header — the most recent non-blank, non-header line.
+        # "Column header" = a line whose tokens are all in the known set
+        # (Election / TOTAL / Day / Mail / Provisional, in any whitespace
+        # arrangement).
+        contest_name = None
+        for j in range(i - 1, -1, -1):
+            stripped = lines[j].strip()
+            if not stripped:
+                continue
+            tokens = stripped.split()
+            if tokens and all(t in _ELECTIONWARE_HEADER_TOKENS for t in tokens):
+                continue
+            contest_name = stripped
+            break
+        if not contest_name:
+            i += 1
+            continue
+
+        # Multi-seat: skip the whole contest.
+        if vote_for_n > 1:
+            i += 1
+            continue
+
+        # Scan forward for candidate rows; stop at the next "Vote For N".
+        i += 1
+        while i < len(lines):
+            line = lines[i]
+            if _ELECTIONWARE_VOTE_FOR_RE.match(line):
+                break
+            cand_match = _ELECTIONWARE_CAND_RE.match(line)
+            if cand_match:
+                name = cand_match.group(1).strip()
+                total = int(cand_match.group(2).replace(',', ''))
+                rows.append({
+                    'contest_name': contest_name,
+                    'candidate': name,
+                    'votes': total,
+                })
+            i += 1
+    return rows
+
+
+def _extract_electionware_pdf(pdf_url: str) -> list[dict]:
+    """Download an Electionware-format PDF and extract raw result rows.
+
+    Uses pdfplumber's layout-preserving text extraction (no LLM, no API
+    key). The PDF is fetched to a temp file because pdfplumber requires
+    seekable input. Uses certifi's CA bundle explicitly so it works on
+    systems whose default trust store doesn't accept the county sites'
+    cert chains.
+    """
+    import ssl
+    import tempfile
+    import certifi  # lazy imports — only needed when this source is used
+    import pdfplumber
+
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+        req = urllib.request.Request(
+            pdf_url, headers={'User-Agent': 'rcv-finder'}
+        )
+        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+            tmp.write(resp.read())
+        tmp_path = tmp.name
+
+    all_lines: list[str] = []
+    with pdfplumber.open(tmp_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text(layout=True)
+            if text:
+                all_lines.extend(text.split('\n'))
+    return _parse_electionware_lines(all_lines)
+
+
+@dataclass(kw_only=True)
+class ElectionwarePdfSource(ElectionSource):
+    """Extract election results from an Electionware-format Summary Results
+    Report PDF using pdfplumber + regex. No LLM, no API key. Works for
+    Berks and many other PA counties that publish via Electionware
+    (Bedford, Blair, Bradford, Carbon, Centre, Chester, Crawford, Elk,
+    Erie, Franklin, etc. all use the same vendor)."""
+    is_primary: bool = False
+
+    def fetch_tidy(self) -> pd.DataFrame:
+        print(f"  extracting Electionware PDF via pdfplumber...")
+        rows = _extract_electionware_pdf(self.url)
+        return _rows_to_tidy(rows, is_primary=self.is_primary)
 
 
 # --- Pipeline ---------------------------------------------------------------
@@ -1123,26 +1262,27 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
 ]
 
 
-# Berks County (mixed lean — Reading is D, surrounding county R) publishes
-# PDF-only results going back to 2003. We extract via Claude (LlmPdfSource);
-# results are cached to .cache/llm/ so reruns are free.
+# Berks County publishes PDF-only results going back to 2003. We extract
+# them with pdfplumber + a regex state machine in `ElectionwarePdfSource`
+# (no API key needed). The same Electionware format is used by many other
+# PA counties, so adding more is one new source registry entry each.
 
 _BERKS_PDF_BASE = "https://www.berkspa.gov/getmedia/"
 
-BERKS_LLM_SOURCES: list[ElectionSource] = [
-    LlmPdfSource(
-        name="2021 Berks Primary", year=2021, category="Primaries", is_primary=True,
-        coverage_note="Berks County (Reading + boroughs + townships)",
-        url=_BERKS_PDF_BASE + "fc57798a-da9a-444c-ae2f-e44ed386ffce/"
-            "Official-Results-State-wide-06-10-2021.pdf",
-    ),
-    LlmPdfSource(
+# 2021 Berks isn't here: their 2021 "Grand Totals" PDF is statewide-only
+# (judges + ballot questions, 5 pages, no local contests), and the
+# corresponding local-race data lives in the separate "By Precinct" PDF
+# which would need a precinct-aware parser. 2023+ Berks publishes a single
+# unified summary PDF that includes local contests at county totals.
+
+BERKS_PDF_SOURCES: list[ElectionSource] = [
+    ElectionwarePdfSource(
         name="2023 Berks Primary", year=2023, category="Primaries", is_primary=True,
         coverage_note="Berks County (Reading + boroughs + townships)",
         url=_BERKS_PDF_BASE + "bd209dc6-bd5c-431c-9072-1abf4e337e94/"
             "PE23-General-Summary-6-28.pdf",
     ),
-    LlmPdfSource(
+    ElectionwarePdfSource(
         name="2025 Berks Primary", year=2025, category="Primaries", is_primary=True,
         coverage_note="Berks County (Reading + boroughs + townships)",
         url=_BERKS_PDF_BASE + "d3291f1d-85d9-4ab8-9447-2cffa3f29b4d/"
@@ -1208,19 +1348,10 @@ if __name__ == "__main__":
     )
     print(f"Saved 2025 PA local workbook to '{pa_local_out}'")
 
-    # --- Mid-sized counties: York + Delaware (Clarity) + Berks (LLM-extracted PDF) ---
-    # Bipartisan coverage: York R-leaning, Delaware D-leaning, Berks mixed.
-    # Berks sources are LLM-extracted from PDFs via the Anthropic SDK — they
-    # only run when ANTHROPIC_API_KEY is set; otherwise we skip them so the
-    # script doesn't fail. Cache makes subsequent runs free.
-    mid_sources: list[ElectionSource] = list(CLARITY_PA_SOURCES)
-    if os.environ.get('ANTHROPIC_API_KEY'):
-        mid_sources += BERKS_LLM_SOURCES
-    else:
-        print("(Skipping Berks LLM sources — set ANTHROPIC_API_KEY to enable.)")
+    # --- Mid-sized counties: York + Delaware (Clarity JSON) + Berks (Electionware PDF) ---
     mid_out = "Pennsylvania_NonMajority_MidCounties.xlsx"
     write_workbook_pooled_by_category(
-        mid_sources, mid_out,
+        CLARITY_PA_SOURCES + BERKS_PDF_SOURCES, mid_out,
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
     print(f"Saved mid-counties workbook to '{mid_out}'")

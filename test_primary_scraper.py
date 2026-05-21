@@ -9,10 +9,11 @@ import pytest
 
 from primary_scraper import (
     _filter_oe_listing,
-    _llm_rows_to_tidy,
     _parse_clarity_summary_json,
+    _parse_electionware_lines,
     _parse_openelections_df,
     _parse_wprdc_summary_df,
+    _rows_to_tidy,
     _strip_middle_initials,
     _wide_columns_to_tidy,
     add_percentages,
@@ -936,22 +937,22 @@ def test_clarity_empty_input_returns_empty_frame():
     assert list(out.columns) == ['Candidate', 'Race_Name', 'Votes']
 
 
-# --- _llm_rows_to_tidy -----------------------------------------------------
+# --- _rows_to_tidy -----------------------------------------------------
 
-def test_llm_rows_to_tidy_round_trip_general():
+def test_rows_to_tidy_round_trip_general():
     rows = [
         {'contest_name': 'Mayor of Reading', 'candidate': 'Eddie Moran',
          'party': 'DEM', 'votes': 5000},
         {'contest_name': 'Mayor of Reading', 'candidate': 'Other Person',
          'party': 'REP', 'votes': 3000},
     ]
-    out = _llm_rows_to_tidy(rows, is_primary=False)
+    out = _rows_to_tidy(rows, is_primary=False)
     assert set(out['Race_Name']) == {'Mayor of Reading'}
     assert set(out['Candidate']) == {'EDDIE MORAN', 'OTHER PERSON'}
     assert sorted(out['Votes'].tolist()) == [3000.0, 5000.0]
 
 
-def test_llm_rows_to_tidy_prepends_party_to_primary_when_missing():
+def test_rows_to_tidy_prepends_party_to_primary_when_missing():
     # LLM forgot to prefix the primary contest name. Should be added from
     # the `party` field — same safety net the WPRDC parser applies.
     rows = [
@@ -960,11 +961,11 @@ def test_llm_rows_to_tidy_prepends_party_to_primary_when_missing():
         {'contest_name': 'Mayor of Reading', 'candidate': 'Mary Smith',
          'party': 'REP', 'votes': 3000},
     ]
-    out = _llm_rows_to_tidy(rows, is_primary=True)
+    out = _rows_to_tidy(rows, is_primary=True)
     assert set(out['Race_Name']) == {'DEM Mayor of Reading', 'REP Mayor of Reading'}
 
 
-def test_llm_rows_to_tidy_drops_meta_rows_if_llm_included_them():
+def test_rows_to_tidy_drops_meta_rows_if_extractor_included_them():
     rows = [
         {'contest_name': 'Mayor', 'candidate': 'Real Person',
          'party': 'DEM', 'votes': 100},
@@ -973,11 +974,11 @@ def test_llm_rows_to_tidy_drops_meta_rows_if_llm_included_them():
         {'contest_name': 'Mayor', 'candidate': 'Write-Ins',
          'party': '', 'votes': 2},
     ]
-    out = _llm_rows_to_tidy(rows, is_primary=False)
+    out = _rows_to_tidy(rows, is_primary=False)
     assert out['Candidate'].tolist() == ['REAL PERSON']
 
 
-def test_llm_rows_to_tidy_applies_candidate_normalization():
+def test_rows_to_tidy_applies_candidate_normalization():
     # Same chain as OE: uppercase, periods stripped, middle initials dropped,
     # party suffix stripped. All variants below should collapse to one row.
     rows = [
@@ -986,12 +987,131 @@ def test_llm_rows_to_tidy_applies_candidate_normalization():
         {'contest_name': 'Mayor', 'candidate': 'RYAN MACKENZIE REP',
          'party': 'REP', 'votes': 50},
     ]
-    out = _llm_rows_to_tidy(rows, is_primary=False)
+    out = _rows_to_tidy(rows, is_primary=False)
     assert out['Candidate'].tolist() == ['RYAN MACKENZIE']
     assert out['Votes'].tolist() == [150.0]
 
 
-def test_llm_rows_to_tidy_empty_input_returns_empty_frame():
-    out = _llm_rows_to_tidy([], is_primary=False)
+def test_rows_to_tidy_empty_input_returns_empty_frame():
+    out = _rows_to_tidy([], is_primary=False)
     assert len(out) == 0
     assert list(out.columns) == ['Candidate', 'Race_Name', 'Votes']
+
+
+# --- _parse_electionware_lines ---------------------------------------------
+
+def test_electionware_parses_modern_4_column_format():
+    # 2023/2025 Berks layout: TOTAL + Election Day + Mail + Provisional.
+    lines = [
+        "                                                                              ",
+        "DEM Judge of the Court of Common Pleas",
+        "Vote For 1",
+        "                              Election",
+        "                      TOTAL             Mail Provisional",
+        "                              Day",
+        "  Justin D. Bodor               13,589  7,838   5,718    33",
+        "  Kurt Geishauser                7,743  4,233   3,487    23",
+        "  Jill Scheidt                  14,698  8,454   6,199    45",
+        "  Write-In Totals                  101      54     47     0",
+        "   Not Assigned                    101      54     47     0",
+    ]
+    rows = _parse_electionware_lines(lines)
+    by_cand = {r['candidate']: r['votes'] for r in rows
+               if r['contest_name'] == 'DEM Judge of the Court of Common Pleas'}
+    # All four real candidate rows captured with TOTAL only (other columns ignored).
+    assert by_cand['Justin D. Bodor'] == 13589
+    assert by_cand['Kurt Geishauser'] == 7743
+    assert by_cand['Jill Scheidt'] == 14698
+    # Write-In Totals / Not Assigned are emitted but the downstream
+    # _rows_to_tidy + _is_non_candidate filter drops them. This test just
+    # confirms the parser doesn't crash on them.
+    assert 'Write-In Totals' in by_cand
+
+
+def test_electionware_parses_legacy_1_column_format():
+    # 2021 Berks layout: just TOTAL, no per-method breakdown.
+    lines = [
+        "DEM JUSTICE OF SUPREME COURT",
+        "Vote For 1",
+        "                       TOTAL",
+        "  MARIA MCLAUGHLIN              21,453",
+        "  Write-In Totals                 165",
+    ]
+    rows = _parse_electionware_lines(lines)
+    by_cand = {r['candidate']: r['votes'] for r in rows
+               if r['contest_name'] == 'DEM JUSTICE OF SUPREME COURT'}
+    assert by_cand['MARIA MCLAUGHLIN'] == 21453
+
+
+def test_electionware_skips_multi_seat_contests():
+    lines = [
+        "DEM Single Seat Race",
+        "Vote For 1",
+        "  Alice                       100  50  50  0",
+        "DEM Multi Seat Race",
+        "Vote For 2",
+        "  Bob                         200  100  100  0",
+        "  Carol                       150   75   75  0",
+        "DEM Another Single Seat",
+        "Vote For 1",
+        "  Dave                         80   40   40  0",
+    ]
+    rows = _parse_electionware_lines(lines)
+    contests = {r['contest_name'] for r in rows}
+    assert contests == {'DEM Single Seat Race', 'DEM Another Single Seat'}
+
+
+def test_electionware_handles_comma_suffixed_candidate_names():
+    # "Santoni, Jr." has an internal comma — the non-greedy name match plus
+    # 4-number suffix should still find the right boundary.
+    lines = [
+        "DEM County Commissioner",
+        "Vote For 1",
+        "  Dante Santoni, Jr.            12,027  6,963   5,027    37",
+        "  Jess Royer                    10,857  5,930   4,901    26",
+    ]
+    rows = _parse_electionware_lines(lines)
+    by_cand = {r['candidate']: r['votes'] for r in rows}
+    assert by_cand['Dante Santoni, Jr.'] == 12027
+    assert by_cand['Jess Royer'] == 10857
+
+
+def test_electionware_skips_column_header_lines_when_finding_contest_title():
+    # If the contest title is followed by column-header lines (Election, TOTAL,
+    # Day, Mail, Provisional) before Vote For, those shouldn't be mistaken
+    # for the title.
+    lines = [
+        "DEM Real Contest Title",
+        "                      Election",
+        "                  TOTAL    Day  Mail Provisional",
+        "Vote For 1",
+        "  Alice                          100   50  50  0",
+    ]
+    rows = _parse_electionware_lines(lines)
+    assert rows == [
+        {'contest_name': 'DEM Real Contest Title', 'candidate': 'Alice', 'votes': 100}
+    ]
+
+
+def test_electionware_walks_across_multiple_contests():
+    lines = [
+        "REP Office A",
+        "Vote For 1",
+        "  Alice                        100   50  50  0",
+        "  Bob                          200  100  90  10",
+        "  Write-In Totals                3    2   1  0",
+        "REP Office B",
+        "Vote For 1",
+        "  Carol                        300  150 140 10",
+    ]
+    rows = _parse_electionware_lines(lines)
+    by_contest = {}
+    for r in rows:
+        by_contest.setdefault(r['contest_name'], []).append(r['candidate'])
+    assert by_contest['REP Office A'] == ['Alice', 'Bob', 'Write-In Totals']
+    assert by_contest['REP Office B'] == ['Carol']
+
+
+def test_electionware_empty_input_returns_empty():
+    assert _parse_electionware_lines([]) == []
+    assert _parse_electionware_lines(['', '', 'random noise', '']) == []
