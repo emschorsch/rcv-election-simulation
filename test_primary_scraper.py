@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from primary_scraper import (
+    _filter_oe_listing,
     _parse_openelections_df,
     _parse_wprdc_summary_df,
     _strip_middle_initials,
@@ -15,6 +16,7 @@ from primary_scraper import (
     add_percentages,
     filter_exclude_race_names,
     filter_min_candidate_percent,
+    filter_min_leader_percent,
     filter_min_winner_votes,
     filter_non_majority,
     filter_race_names,
@@ -226,6 +228,42 @@ def test_filter_min_winner_votes_at_exact_threshold_kept():
         "Candidate": ["A", "B"], "Race_Name": ["X", "X"], "Votes": [100, 50],
     })
     assert len(filter_min_winner_votes(df, min_votes=100)) == 2
+
+
+# --- filter_min_leader_percent ---------------------------------------------
+
+def test_filter_min_leader_percent_drops_write_in_chaos_race():
+    # 20-candidate field where the "leader" got 6%: write-in only race, drop.
+    df = pd.DataFrame({
+        "Candidate": [f"C{i}" for i in range(20)],
+        "Race_Name": ["X"] * 20,
+        "Votes": [60] + [50] * 19,
+        "Percent": [6.0] + [4.9474] * 19,
+    })
+    assert len(filter_min_leader_percent(df, min_percent=10.0)) == 0
+
+
+def test_filter_min_leader_percent_keeps_legitimate_competitive_race():
+    # 6-way primary with leader at 28% — real RCV-relevant race.
+    df = pd.DataFrame({
+        "Candidate": ["A", "B", "C", "D", "E", "F"],
+        "Race_Name": ["X"] * 6,
+        "Votes": [28, 22, 18, 15, 10, 7],
+        "Percent": [28.0, 22.0, 18.0, 15.0, 10.0, 7.0],
+    })
+    out = filter_min_leader_percent(df, min_percent=10.0)
+    assert len(out) == 6
+
+
+def test_filter_min_leader_percent_only_drops_subthreshold_races_when_mixed():
+    df = pd.DataFrame({
+        "Candidate": ["A1", "A2", "B1", "B2"],
+        "Race_Name": ["Real", "Real", "WriteInChaos", "WriteInChaos"],
+        "Votes": [40, 35, 5, 4],
+        "Percent": [40.0, 35.0, 5.0, 4.0],
+    })
+    out = filter_min_leader_percent(df, min_percent=10.0)
+    assert set(out['Race_Name']) == {"Real"}
 
 
 # --- filter_min_candidate_percent ------------------------------------------
@@ -555,15 +593,20 @@ def test_oe_merges_case_variants_of_same_candidate():
     assert out['Votes'].tolist() == [350.0]
 
 
-def test_oe_write_ins_survive_with_empty_party():
+def test_oe_drops_aggregate_write_ins_entries():
+    # Aggregate "Write-ins" rows are dropped because they're the sum of the
+    # individual named write-in rows in the same file — leaving them in
+    # double-counts and inflates the field size in write-in-heavy races.
     df = _oe_df([
         {'county': 'Adams', 'office': 'President', 'district': '',
          'party': 'DEM', 'candidate': 'Biden', 'votes': '100'},
         {'county': 'Adams', 'office': 'President', 'district': '',
          'party': '', 'candidate': 'Write-ins', 'votes': '5'},
+        {'county': 'Adams', 'office': 'President', 'district': '',
+         'party': '', 'candidate': 'Write-in', 'votes': '3'},
     ])
     out = _parse_openelections_df(df, is_primary=False)
-    assert set(out['Candidate']) == {'BIDEN', 'WRITE-INS'}
+    assert set(out['Candidate']) == {'BIDEN'}
 
 
 def test_oe_votes_coerced_to_zero_when_missing():
@@ -766,6 +809,50 @@ def test_wprdc_applies_same_candidate_normalization_as_oe():
     out = _parse_wprdc_summary_df(df, is_primary=True)
     assert out['Candidate'].tolist() == ['WAYNE LANGERHOLC JR']
     assert out['Votes'].tolist() == [300.0]
+
+
+# --- _filter_oe_listing ----------------------------------------------------
+
+def _listing_entry(name):
+    return {'name': name, 'type': 'file'}
+
+
+def test_filter_oe_listing_substr_only_returns_all_matching_files():
+    listing = [
+        _listing_entry('20251104__pa__general__adams__county.csv'),
+        _listing_entry('20251104__pa__general__adams__precinct.csv'),
+        _listing_entry('20251104__pa__primary__adams__county.csv'),
+    ]
+    out = _filter_oe_listing(listing, substr='__general__', suffix='')
+    assert out == [
+        '20251104__pa__general__adams__county.csv',
+        '20251104__pa__general__adams__precinct.csv',
+    ]
+
+
+def test_filter_oe_listing_suffix_disambiguates_county_vs_precinct():
+    # Real 2025 case: dir has both __county.csv and __precinct.csv files.
+    # Without suffix=__county.csv we'd double-count by stitching both.
+    listing = [
+        _listing_entry('20251104__pa__general__adams__county.csv'),
+        _listing_entry('20251104__pa__general__adams__precinct.csv'),
+        _listing_entry('20251104__pa__general__bucks__county.csv'),
+        _listing_entry('20251104__pa__general__bucks__precinct.csv'),
+    ]
+    out = _filter_oe_listing(listing, substr='__general__', suffix='__county.csv')
+    assert out == [
+        '20251104__pa__general__adams__county.csv',
+        '20251104__pa__general__bucks__county.csv',
+    ]
+
+
+def test_filter_oe_listing_ignores_non_file_entries():
+    listing = [
+        {'name': 'subdir', 'type': 'dir'},
+        _listing_entry('20251104__pa__general__adams__county.csv'),
+    ]
+    out = _filter_oe_listing(listing, substr='__general__', suffix='__county.csv')
+    assert out == ['20251104__pa__general__adams__county.csv']
 
 
 def test_wprdc_aggregates_duplicate_candidate_rows_within_race():

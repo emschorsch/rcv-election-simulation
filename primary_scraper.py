@@ -171,6 +171,11 @@ _PARTY_SUFFIX_RE = re.compile(r'\s+(?:' + '|'.join(_PARTY_CODES) + r')\s*$')
 _NON_CANDIDATE_NAMES = frozenset({
     'OVER VOTES', 'UNDER VOTES', 'OVERVOTES', 'UNDERVOTES',
     'NOT ASSIGNED', 'WRITE-IN TOTALS', 'WRITE IN TOTALS',
+    # Aggregate write-in entries get filtered out because they're typically
+    # the *sum* of the individual named write-in rows in the same file —
+    # leaving them in double-counts and inflates the apparent field size in
+    # write-in-heavy races (e.g., a borough mayoral with no listed candidate).
+    'WRITE-IN', 'WRITE-INS', 'WRITE IN', 'WRITE INS', 'WRITEIN', 'WRITEINS',
 })
 
 
@@ -334,13 +339,19 @@ class StitchedOpenElectionsCountiesSource(ElectionSource):
     """Stitch per-county OpenElections CSVs into a single statewide frame.
 
     Lists files at `listing_api_url` (a GitHub Contents API endpoint), keeps
-    files whose name contains `filename_substr`, then fetches each from
-    `raw_base_url + filename` and concatenates. Populates `coverage_note` with
-    the actual file count so partial-coverage years are visibly flagged.
+    files whose name contains `filename_substr` AND ends with `filename_suffix`
+    (if set), then fetches each from `raw_base_url + filename` and concatenates.
+    Populates `coverage_note` with the actual file count so partial-coverage
+    years are visibly flagged.
+
+    `filename_suffix` is needed when a year's `counties/` directory contains
+    both `__county.csv` summary rollups and `__precinct.csv` files for the
+    same county — without it, both get stitched and votes are double-counted.
     """
     listing_api_url: str = ""
     raw_base_url: str = ""
     filename_substr: str = ""
+    filename_suffix: str = ""
     is_primary: bool = False
     expected_counties: int = 67
 
@@ -377,10 +388,24 @@ class StitchedOpenElectionsCountiesSource(ElectionSource):
             raise RuntimeError(
                 f"Unexpected listing response from {self.listing_api_url}: {data!r}"
             )
-        return sorted(
-            d['name'] for d in data
-            if d.get('type') == 'file' and self.filename_substr in d.get('name', '')
-        )
+        return _filter_oe_listing(data, self.filename_substr, self.filename_suffix)
+
+
+def _filter_oe_listing(
+    listing: list[dict],
+    substr: str,
+    suffix: str,
+) -> list[str]:
+    """Filter a GitHub Contents API listing to file entries whose `name`
+    contains `substr` AND ends with `suffix`. Returns sorted file names.
+    Extracted from `StitchedOpenElectionsCountiesSource._list_matching_files`
+    so the filter logic can be unit-tested without mocking HTTP."""
+    return sorted(
+        d['name'] for d in listing
+        if d.get('type') == 'file'
+           and substr in d.get('name', '')
+           and d.get('name', '').endswith(suffix)
+    )
 
 
 # Trailing "(Vote For N)" metadata on WPRDC contest names. Multi-seat (N>1)
@@ -486,6 +511,17 @@ def filter_min_winner_votes(df: pd.DataFrame, min_votes: int = 100) -> pd.DataFr
     return df[max_votes >= min_votes].copy()
 
 
+def filter_min_leader_percent(df: pd.DataFrame, min_percent: float = 10.0) -> pd.DataFrame:
+    """Drop races whose top finisher got less than `min_percent` of the vote.
+
+    Such races are almost always write-in-only contests where no candidate was
+    listed on the ballot — the "field" is just a sprawl of write-in names, none
+    of which has a real shot. They aren't meaningfully RCV-relevant (there's no
+    candidate field for IRV to operate on) and they crowd the output."""
+    max_percent = df.groupby('Race_Name')['Percent'].transform('max')
+    return df[max_percent >= min_percent].copy()
+
+
 def filter_min_candidate_percent(df: pd.DataFrame, min_percent: float = 1.0) -> pd.DataFrame:
     """Drop individual candidate rows below `min_percent`. Display filter only —
     percentages are not recomputed, so the surviving rows still reflect each
@@ -534,6 +570,7 @@ def write_workbook(
     race_exclude_pattern: Optional[str] = None,
     threshold: float = 50.0,
     min_winner_votes: int = 100,
+    min_leader_percent: float = 10.0,
     min_candidate_percent: float = 1.0,
     fuzzy_merge: bool = True,
 ) -> None:
@@ -546,6 +583,7 @@ def write_workbook(
             tidy = add_percentages(tidy)
             tidy = filter_non_majority(tidy, threshold=threshold)
             tidy = filter_min_winner_votes(tidy, min_votes=min_winner_votes)
+            tidy = filter_min_leader_percent(tidy, min_percent=min_leader_percent)
             tidy = filter_min_candidate_percent(tidy, min_percent=min_candidate_percent)
             tidy = filter_race_names(tidy, race_pattern)
             tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
@@ -599,6 +637,7 @@ def write_workbook_pooled_by_category(
     race_exclude_pattern: Optional[str] = None,
     threshold: float = 50.0,
     min_winner_votes: int = 100,
+    min_leader_percent: float = 10.0,
     min_candidate_percent: float = 1.0,
     fuzzy_merge: bool = True,
 ) -> None:
@@ -621,6 +660,7 @@ def write_workbook_pooled_by_category(
         tidy = add_percentages(tidy)
         tidy = filter_non_majority(tidy, threshold=threshold)
         tidy = filter_min_winner_votes(tidy, min_votes=min_winner_votes)
+        tidy = filter_min_leader_percent(tidy, min_percent=min_leader_percent)
         tidy = filter_min_candidate_percent(tidy, min_percent=min_candidate_percent)
         tidy = filter_race_names(tidy, race_pattern)
         tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
@@ -755,12 +795,33 @@ ALLEGHENY_LOCAL_SOURCES: list[ElectionSource] = [
 ]
 
 
+# 2025 PA general statewide local-races source: stitched from OpenElections's
+# per-county tidy CSVs. They published one `__county.csv` summary per PA county
+# for the 2025 municipal cycle, with all 67 counties present. The 2017/2019/
+# 2021/2023 odd-year cycles aren't in OpenElections (verified — those year
+# directories don't exist), so this is single-year coverage for the rest of PA.
+# Allegheny's 2025 data also appears here (alongside its WPRDC copy in the
+# Allegheny workbook); cross-validation is useful, not a bug.
+
+PA_LOCAL_2025_SOURCES: list[ElectionSource] = [
+    StitchedOpenElectionsCountiesSource(
+        name="2025 PA Local (All Counties)",
+        year=2025, category="Generals", is_primary=False,
+        listing_api_url=_OE_API + "2025/counties",
+        raw_base_url=_OE_RAW + "2025/counties/",
+        filename_substr="__general__",
+        filename_suffix="__county.csv",
+    ),
+]
+
+
 # Federal/statewide contests to exclude when running the Allegheny LOCAL
 # workbook. Kept inclusive — both the modern "Justice of the X Court" naming
 # and the older "Judge of the X Court" form, plus office variants.
 _PA_STATE_FEDERAL_RACE_EXCLUDE = (
-    r"justice of the (supreme|superior|commonwealth) court"
-    r"|judge of the (superior|commonwealth|supreme) court"
+    r"justice of the (?:supreme|superior|commonwealth) court"
+    r"|judge of the (?:superior|commonwealth|supreme) court"
+    r"|(?:supreme|superior|commonwealth) court retention"  # retention questions
     r"|president of the united states|^president$"
     r"|u\.?s\.? senator|u\.?s\.? house|u\.?s\.? representative|congress"
     r"|governor|lieutenant governor|attorney general"
@@ -802,3 +863,11 @@ if __name__ == "__main__":
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
     print(f"Saved Allegheny workbook to '{ac_out}'")
+
+    # --- 2025 PA all-counties local races (OpenElections county rollups) ---
+    pa_local_out = "Pennsylvania_NonMajority_Local2025.xlsx"
+    write_workbook_pooled_by_category(
+        PA_LOCAL_2025_SOURCES, pa_local_out,
+        race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
+    )
+    print(f"Saved 2025 PA local workbook to '{pa_local_out}'")
