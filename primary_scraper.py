@@ -383,6 +383,84 @@ class StitchedOpenElectionsCountiesSource(ElectionSource):
         )
 
 
+# Trailing "(Vote For N)" metadata on WPRDC contest names. Multi-seat (N>1)
+# races have no single-winner majority concept, so we skip them entirely for
+# IRV-style analysis.
+_VOTE_FOR_RE = re.compile(r'\s*\(Vote For\s+(\d+)\)\s*$', re.IGNORECASE)
+_WPRDC_META_CONTESTS = frozenset({'BALLOTS CAST', 'REGISTERED VOTERS', 'TURNOUT'})
+
+
+def _parse_wprdc_summary_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFrame:
+    """Aggregate a WPRDC (Allegheny County) summary CSV into [Candidate, Race_Name, Votes].
+
+    Expected columns: contest_name, choice_name, party_name, total_votes
+    (extras ignored). The 2017+ files are pre-aggregated to county totals.
+
+    WPRDC changed its primary-contest naming convention around 2021: newer
+    files include the party in the contest name (`DEM Mayor Pittsburgh`),
+    older ones don't (`Mayor Pittsburgh`, with party only in `party_name`).
+    For primaries we conditionally prepend `party_name` when the contest
+    doesn't already start with a known party code — otherwise DEM and REP
+    primaries for the same office would merge into a single fake race.
+
+    `(Vote For N)` is stripped from contest names; N>1 (multi-seat) rows are
+    dropped because IRV's majority concept doesn't apply. `BALLOTS CAST` /
+    `REGISTERED VOTERS` meta-contest rows are dropped. Candidate strings
+    pass through the same `_normalize_candidate` used for OpenElections.
+    """
+    df = df.copy()
+    contest = df['contest_name'].fillna('').astype(str)
+
+    # Parse and strip the (Vote For N) tail.
+    vf = contest.str.extract(_VOTE_FOR_RE, expand=False)
+    vote_for_n = pd.to_numeric(vf, errors='coerce')
+    contest_base = contest.str.replace(_VOTE_FOR_RE, '', regex=True).str.strip()
+
+    # Build mask of rows to keep.
+    keep = pd.Series(True, index=df.index)
+    keep &= (vote_for_n.isna() | (vote_for_n == 1))  # single-seat only
+    keep &= ~contest_base.str.upper().isin(_WPRDC_META_CONTESTS)
+
+    df = df[keep].reset_index(drop=True)
+    contest_base = contest_base[keep].reset_index(drop=True)
+
+    # For primaries: prepend party_name if not already prefixed (older WPRDC files).
+    if is_primary and 'party_name' in df.columns:
+        party = df['party_name'].fillna('').astype(str).str.strip().str.upper()
+        first_word = contest_base.str.split(' ', n=1).str[0].str.upper()
+        already_prefixed = first_word.isin(_PARTY_CODES)
+        contest_base = contest_base.where(
+            already_prefixed | (party == ''),
+            party + ' ' + contest_base,
+        )
+
+    candidate = _normalize_candidate(df['choice_name'])
+    valid = (candidate != '') & ~candidate.isin(_NON_CANDIDATE_NAMES)
+
+    tidy = pd.DataFrame({
+        'Candidate': candidate[valid].reset_index(drop=True),
+        'Race_Name': contest_base[valid].reset_index(drop=True),
+        'Votes': pd.to_numeric(df.loc[valid, 'total_votes'], errors='coerce')
+                    .fillna(0).reset_index(drop=True),
+    })
+    return tidy.groupby(['Race_Name', 'Candidate'], as_index=False)['Votes'].sum()
+
+
+@dataclass(kw_only=True)
+class WprdcCsvSource(ElectionSource):
+    """Single Allegheny County (WPRDC) summary CSV. The 2017+ files are
+    pre-aggregated to county totals — no precinct stitching needed.
+
+    `coverage_note` should be set explicitly at the source instance level
+    since WPRDC files don't include a `county` column to derive it from.
+    """
+    is_primary: bool = False
+
+    def fetch_tidy(self) -> pd.DataFrame:
+        df = pd.read_csv(self.url, dtype=str)
+        return _parse_wprdc_summary_df(df, is_primary=self.is_primary)
+
+
 # --- Pipeline ---------------------------------------------------------------
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -636,6 +714,62 @@ OPENELECTIONS_PA_SOURCES: list[ElectionSource] = [
 ]
 
 
+# Allegheny County (Pittsburgh) local races, from the Western PA Regional Data
+# Center: https://data.wprdc.org/dataset/election-results. Off-cycle odd-year
+# primaries+generals are where PA local races (DA, mayor, council, etc.) live.
+
+_WPRDC_DUMP = "https://data.wprdc.org/datastore/dump/"
+_AC_COVERAGE = "Allegheny County (Pittsburgh + boroughs)"
+
+ALLEGHENY_LOCAL_SOURCES: list[ElectionSource] = [
+    WprdcCsvSource(name="2017 Allegheny Primary", year=2017, category="Primaries",
+                   is_primary=True, coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "abfa5c73-4152-4d37-b8d4-c7df517c3b49"),
+    WprdcCsvSource(name="2017 Allegheny General", year=2017, category="Generals",
+                   coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "542c655c-b3f5-43ec-8626-e2cd9253af9e"),
+    WprdcCsvSource(name="2019 Allegheny Primary", year=2019, category="Primaries",
+                   is_primary=True, coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "153b6de5-06f5-4061-a417-384331b842c3"),
+    WprdcCsvSource(name="2019 Allegheny General", year=2019, category="Generals",
+                   coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "91c50f7e-8b49-4835-9fef-b7b3f4f0ce82"),
+    WprdcCsvSource(name="2021 Allegheny Primary", year=2021, category="Primaries",
+                   is_primary=True, coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "1d37bc6b-b5ab-41ca-a006-da7de348b883"),
+    WprdcCsvSource(name="2021 Allegheny General", year=2021, category="Generals",
+                   coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "73b61240-e3c5-444c-bd1b-68d19d5eb4d5"),
+    WprdcCsvSource(name="2023 Allegheny Primary", year=2023, category="Primaries",
+                   is_primary=True, coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "4b38a2aa-09e8-4cbe-9fdd-40fd84012178"),
+    WprdcCsvSource(name="2023 Allegheny General", year=2023, category="Generals",
+                   coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "6010ffdd-6d2d-4962-94eb-24d38b0a245b"),
+    WprdcCsvSource(name="2025 Allegheny Primary", year=2025, category="Primaries",
+                   is_primary=True, coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "6051ca15-fb5d-425b-890c-a25c8c9b0c73"),
+    WprdcCsvSource(name="2025 Allegheny General", year=2025, category="Generals",
+                   coverage_note=_AC_COVERAGE,
+                   url=_WPRDC_DUMP + "5b094e63-1659-45d9-b249-34cf3a06c50f"),
+]
+
+
+# Federal/statewide contests to exclude when running the Allegheny LOCAL
+# workbook. Kept inclusive — both the modern "Justice of the X Court" naming
+# and the older "Judge of the X Court" form, plus office variants.
+_PA_STATE_FEDERAL_RACE_EXCLUDE = (
+    r"justice of the (supreme|superior|commonwealth) court"
+    r"|judge of the (superior|commonwealth|supreme) court"
+    r"|president of the united states|^president$"
+    r"|u\.?s\.? senator|u\.?s\.? house|u\.?s\.? representative|congress"
+    r"|governor|lieutenant governor|attorney general"
+    r"|auditor general|state treasurer"
+    r"|senator in the general assembly|representative in the general assembly"
+    r"|state senator|state representative"
+)
+
+
 # --- Entry point ------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -660,3 +794,11 @@ if __name__ == "__main__":
         race_exclude_pattern=r"president",
     )
     print(f"Saved PA workbook to '{pa_out}'")
+
+    # --- Allegheny County local races (WPRDC, 2017-2025 odd-year cycles) ---
+    ac_out = "Allegheny_NonMajority_Local.xlsx"
+    write_workbook_pooled_by_category(
+        ALLEGHENY_LOCAL_SOURCES, ac_out,
+        race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
+    )
+    print(f"Saved Allegheny workbook to '{ac_out}'")

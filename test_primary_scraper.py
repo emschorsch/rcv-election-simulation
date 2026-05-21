@@ -9,6 +9,7 @@ import pytest
 
 from primary_scraper import (
     _parse_openelections_df,
+    _parse_wprdc_summary_df,
     _strip_middle_initials,
     _wide_columns_to_tidy,
     add_percentages,
@@ -681,3 +682,101 @@ def test_format_pooled_skips_sources_with_empty_dataframes():
     out = format_pooled_for_sheet([(source_empty, empty_df), (source_data, data_df)])
     non_blank = out[out['Race_Name'] != '']
     assert non_blank['Year'].tolist() == [2020]
+
+
+# --- _parse_wprdc_summary_df -----------------------------------------------
+
+def _wprdc_df(rows):
+    cols = ['contest_name', 'choice_name', 'party_name', 'total_votes']
+    return pd.DataFrame(rows, columns=cols).astype(str).replace('nan', '')
+
+
+def test_wprdc_strips_vote_for_1_from_race_name():
+    df = _wprdc_df([
+        {'contest_name': 'District Attorney (Vote For 1)',
+         'choice_name': 'Matt Dugan', 'party_name': 'DEM', 'total_votes': '100'},
+    ])
+    out = _parse_wprdc_summary_df(df, is_primary=False)
+    assert out['Race_Name'].tolist() == ['District Attorney']
+    assert out['Candidate'].tolist() == ['MATT DUGAN']
+
+
+def test_wprdc_drops_multi_seat_vote_for_n_races():
+    # "Vote For 2" is a multi-seat race; IRV majority doesn't apply.
+    df = _wprdc_df([
+        {'contest_name': 'County Council At-Large (Vote For 2)',
+         'choice_name': 'Alice', 'party_name': 'DEM', 'total_votes': '100'},
+        {'contest_name': 'County Council At-Large (Vote For 2)',
+         'choice_name': 'Bob', 'party_name': 'DEM', 'total_votes': '90'},
+        {'contest_name': 'Mayor (Vote For 1)',
+         'choice_name': 'Carol', 'party_name': 'DEM', 'total_votes': '100'},
+    ])
+    out = _parse_wprdc_summary_df(df, is_primary=False)
+    assert out['Race_Name'].tolist() == ['Mayor']
+
+
+def test_wprdc_primary_contest_keeps_party_prefix():
+    df = _wprdc_df([
+        {'contest_name': 'DEM Mayor of Pittsburgh (Vote For 1)',
+         'choice_name': 'Ed Gainey', 'party_name': 'DEM', 'total_votes': '100'},
+        {'contest_name': 'REP Mayor of Pittsburgh (Vote For 1)',
+         'choice_name': 'Tony Moreno', 'party_name': 'REP', 'total_votes': '50'},
+    ])
+    out = _parse_wprdc_summary_df(df, is_primary=True)
+    assert set(out['Race_Name']) == {'DEM Mayor of Pittsburgh', 'REP Mayor of Pittsburgh'}
+
+
+def test_wprdc_primary_prepends_party_when_missing_from_contest_name():
+    # Older WPRDC files (2017, 2019) don't include the party in contest_name,
+    # only in party_name. Without prepending, DEM and REP primaries for the
+    # same office would merge into one bogus race.
+    df = _wprdc_df([
+        {'contest_name': 'Mayor Bellevue (Vote For 1)',
+         'choice_name': 'Alice', 'party_name': 'DEM', 'total_votes': '100'},
+        {'contest_name': 'Mayor Bellevue (Vote For 1)',
+         'choice_name': 'Bob', 'party_name': 'REP', 'total_votes': '40'},
+    ])
+    out = _parse_wprdc_summary_df(df, is_primary=True)
+    assert set(out['Race_Name']) == {'DEM Mayor Bellevue', 'REP Mayor Bellevue'}
+
+
+def test_wprdc_drops_ballots_cast_and_registered_voters_meta_rows():
+    df = _wprdc_df([
+        {'contest_name': 'BALLOTS CAST - Nonpartisan (Vote For 0)',
+         'choice_name': 'BALLOTS CAST', 'party_name': 'NON', 'total_votes': '50000'},
+        {'contest_name': 'REGISTERED VOTERS - Nonpartisan (Vote For 0)',
+         'choice_name': 'REGISTERED VOTERS', 'party_name': 'NON', 'total_votes': '100000'},
+        {'contest_name': 'Mayor (Vote For 1)',
+         'choice_name': 'Real Person', 'party_name': 'DEM', 'total_votes': '100'},
+    ])
+    out = _parse_wprdc_summary_df(df, is_primary=False)
+    assert out['Race_Name'].tolist() == ['Mayor']
+    assert out['Candidate'].tolist() == ['REAL PERSON']
+
+
+def test_wprdc_applies_same_candidate_normalization_as_oe():
+    # Periods, party-suffix, and middle-initial cleanups should all fire,
+    # collapsing the variants into one row.
+    df = _wprdc_df([
+        {'contest_name': 'DEM Mayor (Vote For 1)',
+         'choice_name': 'Wayne L. Langerholc, Jr', 'party_name': 'DEM', 'total_votes': '100'},
+        {'contest_name': 'DEM Mayor (Vote For 1)',
+         'choice_name': 'Wayne Langerholc Jr DEM', 'party_name': 'DEM', 'total_votes': '200'},
+    ])
+    out = _parse_wprdc_summary_df(df, is_primary=True)
+    assert out['Candidate'].tolist() == ['WAYNE LANGERHOLC JR']
+    assert out['Votes'].tolist() == [300.0]
+
+
+def test_wprdc_aggregates_duplicate_candidate_rows_within_race():
+    # Defensive: if a file somehow has two rows for the same (race, candidate),
+    # they should sum rather than duplicate.
+    df = _wprdc_df([
+        {'contest_name': 'Mayor (Vote For 1)',
+         'choice_name': 'Alice', 'party_name': 'DEM', 'total_votes': '60'},
+        {'contest_name': 'Mayor (Vote For 1)',
+         'choice_name': 'Alice', 'party_name': 'DEM', 'total_votes': '40'},
+    ])
+    out = _parse_wprdc_summary_df(df, is_primary=False)
+    assert out['Candidate'].tolist() == ['ALICE']
+    assert out['Votes'].tolist() == [100.0]
