@@ -1411,6 +1411,14 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         coverage_note="Northumberland County (Sunbury + Shamokin + boroughs)",
         url=_NUMCO_PDF_BASE + "2025_0520_official/overall.pdf",
     ),
+    # Indiana County (Indiana + boroughs + townships). Only 2025 PDF URL
+    # was readily discoverable; older years require drilling.
+    ElectionwarePdfSource(
+        name="2025 Indiana Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Indiana County (Indiana + boroughs + townships)",
+        url="https://www.indianacountypa.gov/wp-content/uploads/"
+            "May-20-2025-offical-results-summary-with-write-ins.pdf",
+    ),
 ]
 
 
