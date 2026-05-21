@@ -37,7 +37,7 @@ Adding a new election source is one new class + one entry in a hardcoded source 
 | OpenElections PA (`<year>/counties/*.csv`) | 2020 primary (48/67), 2022 general (24/67), 2024 primary (10/67), **2025 general (67/67)** | Statewide if you stitch; partial in many years | ✅ Integrated as `StitchedOpenElectionsCountiesSource`. |
 | WPRDC (`data.wprdc.org`) | Allegheny County 2012–2025, every primary + general | Pre-aggregated to county totals, includes **local races** | ✅ Integrated as `WprdcCsvSource` for 2017+. |
 | **Clarity Elections** (`results.enr.clarityelections.com`) | **York 2023–2025, Delaware 2024–2025** | JSON-API for mid-size county results, summary endpoint pre-aggregated | ✅ Integrated as `ClaritySummaryJsonSource`. CloudFront requires browser User-Agent. |
-| **Electionware PDFs** (`berkspa.gov`, `chesco.org`, …) | **Berks 2023/2025, Chester 2021/2023/2025** | Berks: Reading + surrounding municipalities. Chester: West Chester + 230 precincts. Same vendor format ≈ many other PA counties available with one-line additions. | ✅ Integrated as `ElectionwarePdfSource` (pdfplumber + regex, no API key needed). `LlmPdfSource` retained as an alternative for novel PDF layouts. |
+| **Electionware PDFs** (`berkspa.gov`, `chesco.org`, `norcopa.gov`, `centrecountypa.gov`, …) | **Berks 2023/2025, Chester 2021/2023/2025, Northampton 2021/2023/2025, Centre 2025** | Reading, West Chester, Bethlehem/Easton, State College + their surrounding municipalities. Same vendor format ≈ many other PA counties available with one-line additions. | ✅ Integrated as `ElectionwarePdfSource` (pdfplumber + regex, no API key needed). `LlmPdfSource` retained as an alternative for novel PDF layouts. |
 | Lehigh / Bucks / Chester / Montgomery county portals | Variable | Local races for each county | ❌ Deferred — PDF-only, would need per-county work. Could be added via `LlmPdfSource` later. |
 | PA Department of State (`electionreturns.pa.gov`) | All 67 counties statewide | Federal/state races only, not local | ❌ Not pursued — duplicates OE statewide coverage; doesn't add local. |
 | OpenElections PA pre-2018 | 2000–2016 fixed-width files | Older races | ❌ Deferred — different schema; would need new parser. |
@@ -223,6 +223,12 @@ Selection of races that came out of the cleanup as genuine RCV-relevant cases:
 - 2023 Chester DEM Magisterial District Judge District 15-3-06: 4-way (Hutton 36.7% / Colon 23.2% / McDermott 21.5% / Hashem 11.6%)
 - 2023 Chester REP Magisterial District Judge District 15-3-06: 4-way with the same Hashem/McDermott/Colon names (cross-filed) plus Tim Arndt 43.1%
 - 2025 Chester REP Township Supervisor West Caln: Mininger 43.1% / Martin 33.8% / Hutton 23.1%
+- 2021 Northampton DEM Magisterial District Judge 03-2-09: 4-way at 39.4% / 39.2% / 12.4% / 9.0% — top two within 0.2 points
+- 2021 Northampton REP same district: 36.3% / 28.0% / 22.9% / 12.8% — cross-filed counterpart
+- 2023 Northampton DEM Hellertown Borough Council 2yr: 4-way at 31.5% / 30.9% / 21.0% / 16.6%
+- 2023 Northampton REP Commissioner Bethlehem Twsp 1st Ward: 46.2% / 45.9% / 7.9% — extremely close 2-way with a spoiler
+- 2025 Northampton REP Judge of the Court of Common Pleas: Fuller 47.2% / Clark 34.0% / Eyer 18.8%
+- 2025 Northampton DEM School Director Northampton Area Region III: Flamisch 47.1% / Gogel 32.9% / Marchiano 20.0%
 
 ## Out of scope (deferred)
 

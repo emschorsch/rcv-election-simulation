@@ -772,6 +772,11 @@ _ELECTIONWARE_HEADER_TOKENS = frozenset({
     'election', 'total', 'day', 'mail', 'provisional',
     'mail-in', 'absentee', 'absentee/', 'absentee/mail-in',
     'military', 'extra',
+    # Northampton wraps the Provisional/Mail headers as
+    # "Mail Votes" and "Provisional Votes". Including 'votes' is safe
+    # because a real contest title that's only header-set words is
+    # extremely unlikely.
+    'votes',
 })
 # Candidate row: indented name (no digits, no % signs — that constraint is
 # important; without it, `(.+?)` would happily swallow the percent column
@@ -1284,6 +1289,8 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
 
 _BERKS_PDF_BASE = "https://www.berkspa.gov/getmedia/"
 _CHESCO_PDF_BASE = "https://www.chesco.org/DocumentCenter/View/"
+_NORCO_PDF_BASE = "https://www.norcopa.gov/corecode/uploads/document6/uploaded_pdfs/corecode/"
+_CENTRE_PDF_BASE = "https://centrecountypa.gov/DocumentCenter/View/"
 
 # 2021 Berks isn't here: their 2021 "Grand Totals" PDF is statewide-only
 # (judges + ballot questions, 5 pages, no local contests), and the
@@ -1321,6 +1328,32 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         name="2025 Chester Primary", year=2025, category="Primaries", is_primary=True,
         coverage_note="Chester County (West Chester + boroughs + townships)",
         url=_CHESCO_PDF_BASE + "80017",
+    ),
+    # Northampton County (Bethlehem + Easton + boroughs/townships). PDFs
+    # under corecode/uploaded_pdfs/. The 2023 and 2025 filenames have spaces
+    # in them, hence the %20 encoding.
+    ElectionwarePdfSource(
+        name="2021 Northampton Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Northampton County (Bethlehem + Easton + boroughs)",
+        url=_NORCO_PDF_BASE + "pe2021_243.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Northampton Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Northampton County (Bethlehem + Easton + boroughs)",
+        url=_NORCO_PDF_BASE + "Election%20Summary%20PE%202023_6.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Northampton Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Northampton County (Bethlehem + Easton + boroughs)",
+        url=_NORCO_PDF_BASE + "PE25%20Summary%20Results_1804.pdf",
+    ),
+    # Centre County (State College + Bellefonte + townships). Only the
+    # 2025 PDF ID was discovered cleanly; 2021/2023 land on year-specific
+    # pages that we couldn't drill into in one pass.
+    ElectionwarePdfSource(
+        name="2025 Centre Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Centre County (State College + Bellefonte + townships)",
+        url=_CENTRE_PDF_BASE + "31108/election-summary",
     ),
 ]
 
