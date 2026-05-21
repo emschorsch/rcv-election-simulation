@@ -1296,6 +1296,7 @@ _CENTRE_PDF_BASE = "https://centrecountypa.gov/DocumentCenter/View/"
 _LEBCO_PDF_BASE = "https://www.lebanoncountypa.gov/getmedia/"
 _MERCER_PDF_BASE = "https://www.mercercountypa.gov/election/Election.Results/"
 _NUMCO_PDF_BASE = "https://www.northumberlandcountypa.gov/htdocs/wp-content/uploads/documents/elections/"
+_SCHU_PDF_BASE = "https://schuylkillcountypa.gov/Document_Center/Departments/Election%20Bureau/"
 
 # 2021 Berks isn't here: their 2021 "Grand Totals" PDF is statewide-only
 # (judges + ballot questions, 5 pages, no local contests), and the
@@ -1418,6 +1419,19 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         coverage_note="Indiana County (Indiana + boroughs + townships)",
         url="https://www.indianacountypa.gov/wp-content/uploads/"
             "May-20-2025-offical-results-summary-with-write-ins.pdf",
+    ),
+    # Schuylkill County (Pottsville + boroughs + townships). 2021 isn't
+    # on the current results page — would require the archived results
+    # site at co.schuylkill.pa.us (interactive viewer, no direct PDFs).
+    ElectionwarePdfSource(
+        name="2023 Schuylkill Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Schuylkill County (Pottsville + boroughs + townships)",
+        url=_SCHU_PDF_BASE + "2023/Primary/2023%20Municipal%20Primary%20Official%20Results.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Schuylkill Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Schuylkill County (Pottsville + boroughs + townships)",
+        url=_SCHU_PDF_BASE + "2025/Primary/Official%20Election%20Results.pdf",
     ),
 ]
 
