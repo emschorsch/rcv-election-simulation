@@ -177,6 +177,7 @@ _NON_CANDIDATE_NAMES = frozenset({
     'TOTAL VOTES CAST',  # Chester Electionware footer per contest
     'CONTEST TOTALS',    # Mercer / Northumberland: total ballots cast in the contest
     'TIMES BLANK VOTED', 'TIMES OVER VOTED', 'TIMES UNDER VOTED',  # Electionware stat rows
+    'TOTAL',  # Lycoming per-contest sum row
 })
 
 # Anything matching this is treated as a write-in aggregate/variant and
@@ -857,18 +858,18 @@ def _parse_electionware_lines(lines: list[str]) -> list[dict]:
     return rows
 
 
-def _extract_electionware_pdf(pdf_url: str) -> list[dict]:
-    """Download an Electionware-format PDF and extract raw result rows.
+def _pdf_url_to_lines(pdf_url: str) -> list[str]:
+    """Download a PDF and return its text as a list of layout-preserved lines.
 
-    Uses pdfplumber's layout-preserving text extraction (no LLM, no API
-    key). The PDF is fetched to a temp file because pdfplumber requires
-    seekable input. Uses certifi's CA bundle explicitly so it works on
-    systems whose default trust store doesn't accept the county sites'
-    cert chains.
+    Shared helper used by every PDF source. `certifi` provides the CA
+    bundle explicitly because the system Python's default trust store
+    doesn't accept some county sites' cert chains. We send a friendly
+    `rcv-finder` User-Agent — CloudFront-fronted sites are handled
+    separately by `ClaritySummaryJsonSource` with a browser UA.
     """
     import ssl
     import tempfile
-    import certifi  # lazy imports — only needed when this source is used
+    import certifi  # lazy imports — only needed when a PDF source is used
     import pdfplumber
 
     ctx = ssl.create_default_context(cafile=certifi.where())
@@ -886,7 +887,12 @@ def _extract_electionware_pdf(pdf_url: str) -> list[dict]:
             text = page.extract_text(layout=True)
             if text:
                 all_lines.extend(text.split('\n'))
-    return _parse_electionware_lines(all_lines)
+    return all_lines
+
+
+def _extract_electionware_pdf(pdf_url: str) -> list[dict]:
+    """Download an Electionware-format PDF and extract raw result rows."""
+    return _parse_electionware_lines(_pdf_url_to_lines(pdf_url))
 
 
 @dataclass(kw_only=True)
@@ -901,6 +907,84 @@ class ElectionwarePdfSource(ElectionSource):
     def fetch_tidy(self) -> pd.DataFrame:
         print(f"  extracting Electionware PDF via pdfplumber...")
         rows = _extract_electionware_pdf(self.url)
+        return _rows_to_tidy(rows, is_primary=self.is_primary)
+
+
+# Lycoming's PDFs use a different vendor format. Each contest is announced
+# on ONE line with its name, party-in-parens, vote-for-N, and turnout stats:
+#     "District Attorney (Dem) (Vote for 1), 18804 registered voters, ..."
+# Candidate rows follow, indented, with columns:
+#     <name>  <total votes>  <vote%>%  <election day>  <mail in>  <provisional>
+# A "Total" row closes each contest (sum of candidates — dropped via
+# `_NON_CANDIDATE_NAMES` since 'TOTAL' is now in the literal set).
+
+# Partisan contest header: name + party in parens + "Vote for N", followed
+# by a comma and turnout stats.
+_LYCOMING_CONTEST_RE = re.compile(
+    r'^\s*(.+?)\s+\(([A-Za-z]+)\)\s+\(Vote for (\d+)\),'
+)
+# Any contest header (partisan or non-partisan ballot question). Used to
+# detect when a *new* race starts so we don't keep bundling YES/NO votes
+# from a ballot question into the previously-seen partisan contest.
+_LYCOMING_ANY_CONTEST_RE = re.compile(
+    r'^\s*(.+?)\s+\(Vote for (\d+)\),'
+)
+_LYCOMING_CAND_RE = re.compile(
+    r'^\s+([A-Za-z][^\d%]*?)\s+([\d,]+)\s+[\d.]+%\s+[\d,]+\s+[\d,]+\s+[\d,]+\s*$'
+)
+
+
+def _parse_lycoming_pdf_lines(lines: list[str]) -> list[dict]:
+    """Parse Lycoming-format PDF text lines into raw result rows.
+
+    Pure function — no I/O. Skips multi-seat races (Vote for N>1) and
+    non-partisan contests like ballot questions (the YES/NO rows would
+    otherwise be miscredited to whatever partisan contest preceded them).
+    Contest names are emitted with the party prefix from the parens,
+    matching the convention used by `_rows_to_tidy` for primaries.
+    """
+    rows: list[dict] = []
+    current_contest: Optional[str] = None
+    for line in lines:
+        any_match = _LYCOMING_ANY_CONTEST_RE.match(line)
+        if any_match:
+            partisan = _LYCOMING_CONTEST_RE.match(line)
+            if partisan:
+                base = partisan.group(1).strip()
+                party = partisan.group(2).strip().upper()
+                vote_for = int(partisan.group(3))
+                current_contest = None if vote_for > 1 else f"{party} {base}"
+            else:
+                # Non-partisan contest (ballot question, etc.) — drop entirely
+                current_contest = None
+            continue
+        if current_contest is None:
+            continue
+        cm = _LYCOMING_CAND_RE.match(line)
+        if cm:
+            name = cm.group(1).strip()
+            total = int(cm.group(2).replace(',', ''))
+            rows.append({
+                'contest_name': current_contest,
+                'candidate': name,
+                'votes': total,
+            })
+    return rows
+
+
+@dataclass(kw_only=True)
+class LycomingPdfSource(ElectionSource):
+    """Extract election results from Lycoming County's PDF format.
+
+    Different vendor than Electionware — uses inline contest headers
+    (`<contest> (Dem) (Vote for 1), <stats>`) and candidate rows with
+    a percent column. Multi-seat races are skipped.
+    """
+    is_primary: bool = False
+
+    def fetch_tidy(self) -> pd.DataFrame:
+        print("  extracting Lycoming PDF via pdfplumber...")
+        rows = _parse_lycoming_pdf_lines(_pdf_url_to_lines(self.url))
         return _rows_to_tidy(rows, is_primary=self.is_primary)
 
 
@@ -1451,6 +1535,33 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
 ]
 
 
+# Lycoming County (Williamsport + boroughs + townships) uses a different PDF
+# vendor — inline contest headers with party in parens, plus a VOTE % column.
+# Parsed by `LycomingPdfSource`.
+_LYCOMING_PDF_BASE = (
+    "https://lycomingcountypa.gov/Documents/Government/Departments/"
+    "Voter%20Services/PreviousResults/"
+)
+
+LYCOMING_PDF_SOURCES: list[ElectionSource] = [
+    LycomingPdfSource(
+        name="2021 Lycoming Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Lycoming County (Williamsport + boroughs + townships)",
+        url=_LYCOMING_PDF_BASE + "2021MPOfficial.pdf",
+    ),
+    LycomingPdfSource(
+        name="2023 Lycoming Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Lycoming County (Williamsport + boroughs + townships)",
+        url=_LYCOMING_PDF_BASE + "2023MPOfficial.pdf",
+    ),
+    LycomingPdfSource(
+        name="2025 Lycoming Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Lycoming County (Williamsport + boroughs + townships)",
+        url=_LYCOMING_PDF_BASE + "2025MPOfficial.pdf",
+    ),
+]
+
+
 # Federal/statewide contests to exclude when running the Allegheny LOCAL
 # workbook. Kept inclusive — both the modern "Justice of the X Court" naming
 # and the older "Judge of the X Court" form, plus office variants.
@@ -1508,10 +1619,10 @@ if __name__ == "__main__":
     )
     print(f"Saved 2025 PA local workbook to '{pa_local_out}'")
 
-    # --- Mid-sized counties: York + Delaware (Clarity JSON), Berks + Chester (Electionware PDF) ---
+    # --- Mid-sized counties: York/Delaware (Clarity), Electionware + Lycoming PDFs ---
     mid_out = "Pennsylvania_NonMajority_MidCounties.xlsx"
     write_workbook_pooled_by_category(
-        CLARITY_PA_SOURCES + ELECTIONWARE_PDF_SOURCES, mid_out,
+        CLARITY_PA_SOURCES + ELECTIONWARE_PDF_SOURCES + LYCOMING_PDF_SOURCES, mid_out,
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
     print(f"Saved mid-counties workbook to '{mid_out}'")

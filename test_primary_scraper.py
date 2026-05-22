@@ -11,6 +11,7 @@ from primary_scraper import (
     _filter_oe_listing,
     _parse_clarity_summary_json,
     _parse_electionware_lines,
+    _parse_lycoming_pdf_lines,
     _parse_openelections_df,
     _parse_wprdc_summary_df,
     _rows_to_tidy,
@@ -1115,6 +1116,66 @@ def test_electionware_walks_across_multiple_contests():
 def test_electionware_empty_input_returns_empty():
     assert _parse_electionware_lines([]) == []
     assert _parse_electionware_lines(['', '', 'random noise', '']) == []
+
+
+# --- _parse_lycoming_pdf_lines ---------------------------------------------
+
+def test_lycoming_parses_partisan_primary_contest():
+    lines = [
+        "       District Attorney (Dem) (Vote for 1), 18804 registered voters, turnout 26.97%",
+        "          Jane Smith            500   55.56%  300   200    0",
+        "          John Doe              400   44.44%  250   150    0",
+        "          Write-in                0    0.00%   0     0     0",
+        "          Total                 900  100.00%  550   350    0",
+    ]
+    rows = _parse_lycoming_pdf_lines(lines)
+    by_cand = {r['candidate']: r['votes'] for r in rows}
+    assert by_cand == {'Jane Smith': 500, 'John Doe': 400, 'Write-in': 0, 'Total': 900}
+    contests = {r['contest_name'] for r in rows}
+    assert contests == {'DEM District Attorney'}
+
+
+def test_lycoming_skips_multi_seat_races():
+    lines = [
+        "       Loyalsock SD (Dem) (Vote for 4), 2100 registered voters, turnout 27.00%",
+        "          Holly N. Shadle       406  24.34%  218   188    0",
+        "       District Attorney (Dem) (Vote for 1), 18804 registered voters, turnout 26.97%",
+        "          Jane Smith            500   55.56%  300   200    0",
+    ]
+    rows = _parse_lycoming_pdf_lines(lines)
+    contests = {r['contest_name'] for r in rows}
+    assert contests == {'DEM District Attorney'}
+
+
+def test_lycoming_does_not_bundle_ballot_question_votes_into_prior_race():
+    # Real-world bug: Lycoming PDFs include non-partisan ballot questions
+    # ("Cascade Ballot Question (Vote for 1), ...") on the last page after
+    # the partisan races. The "(Vote for 1)" pattern alone shouldn't keep
+    # the previous contest active — the YES/NO votes underneath would
+    # otherwise get attributed to the last partisan race seen.
+    lines = [
+        "       Inspector of Elections (Rep) (Vote for 1), 637 registered voters, turnout 23.08%",
+        "          Lenora G. Georges     127   99.22%  108    19    0",
+        "          Write-in                1    0.78%   1     0     0",
+        "          Total                 128  100.00% 109    19    0",
+        "       Cascade Ballot Question (Vote for 1), 306 registered voters, turnout 21.57%",
+        "          Yes                    43   66.15%  33    10    0",
+        "          No                     22   33.85%  19     3    0",
+        "          Total                  65  100.00%  52    13    0",
+    ]
+    rows = _parse_lycoming_pdf_lines(lines)
+    # Yes/No should NOT appear under the Rep Inspector contest.
+    cands_by_contest = {}
+    for r in rows:
+        cands_by_contest.setdefault(r['contest_name'], set()).add(r['candidate'])
+    assert cands_by_contest == {
+        'REP Inspector of Elections': {'Lenora G. Georges', 'Write-in', 'Total'},
+    }
+
+
+def test_lycoming_empty_input_returns_empty():
+    assert _parse_lycoming_pdf_lines([]) == []
+    assert _parse_lycoming_pdf_lines(['some random text', '']) == []
 
 
 def test_electionware_handles_layout_with_percent_column():
