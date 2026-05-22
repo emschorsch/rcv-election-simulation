@@ -1297,6 +1297,7 @@ _LEBCO_PDF_BASE = "https://www.lebanoncountypa.gov/getmedia/"
 _MERCER_PDF_BASE = "https://www.mercercountypa.gov/election/Election.Results/"
 _NUMCO_PDF_BASE = "https://www.northumberlandcountypa.gov/htdocs/wp-content/uploads/documents/elections/"
 _SCHU_PDF_BASE = "https://schuylkillcountypa.gov/Document_Center/Departments/Election%20Bureau/"
+_LEHIGH_PDF_BASE = "https://www.lehighcounty.org/Portals/0/PDF/"
 
 # 2021 Berks isn't here: their 2021 "Grand Totals" PDF is statewide-only
 # (judges + ballot questions, 5 pages, no local contests), and the
@@ -1432,6 +1433,20 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         name="2025 Schuylkill Primary", year=2025, category="Primaries", is_primary=True,
         coverage_note="Schuylkill County (Pottsville + boroughs + townships)",
         url=_SCHU_PDF_BASE + "2025/Primary/Official%20Election%20Results.pdf",
+    ),
+    # Lehigh County (Allentown + boroughs + townships). 2021 primary
+    # is the canonical PA RCV case — Tuerk won the 6-way DEM Allentown
+    # mayoral by 122 votes over the incumbent. 2023 is live-portal only
+    # on Lehigh's site (no direct PDF).
+    ElectionwarePdfSource(
+        name="2021 Lehigh Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Lehigh County (Allentown + boroughs + townships)",
+        url=_LEHIGH_PDF_BASE + "ElectionSummary12.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Lehigh Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Lehigh County (Allentown + boroughs + townships)",
+        url=_LEHIGH_PDF_BASE + "Voter/LehighSummaryFirstCert.pdf",
     ),
 ]
 
