@@ -170,13 +170,24 @@ Surfaced when a spot-check noticed `MAYOR MARION HEIGHTS BOROUGH` (Northumberlan
 
 This isn't a fully general fix — other PA counties may have similar OE-parsing bugs. A broader heuristic (drop OE general-election Vote-For-1 races with 3+ same-party candidates, since PA primary law makes that essentially impossible) is deferred until we encounter more cases; it would require preserving party info through the pipeline, a moderate refactor.
 
-### 14. Multi-seat OE races masquerading as Vote-For-1
+### 14. Multi-seat races masquerading as Vote-For-1 (universal filter)
 
 Surfaced when a spot-check flagged `SCHOOL DIRECTOR DEER LAKES` (Allegheny, 2025) in the curated top-races output. WPRDC has the same race as `"School Director Deer Lakes (Vote For 4)"` — voters pick 4 of 5 candidates and the top 4 win. OpenElections strips the `(Vote For N)` metadata when converting county PDFs to their tidy CSVs, so `_parse_openelections_df` had no way to know it was multi-seat; the five candidates at ~20% each looked like a wide-open Vote For 1 race.
 
 This was inflating the 2025 all-PA workbook significantly: 389 SCHOOL DIRECTOR races and 455 COUNCIL races, most of them multi-seat.
 
-**Fix**: heuristic filter `_is_likely_multiseat_oe_race` that flags office names which are almost always multi-seat in PA — School Director / School Board, County Commissioner (Vote For 2 by law), at-large Borough/City/Township Council. District-numbered races (`"Council District 9"`) are explicitly excluded from the filter since those are Vote For 1. Applied only inside `_parse_openelections_df`; the WPRDC and Clarity sources preserve `(Vote For N)` correctly and don't need this. Dropped the 2025 all-PA workbook from 1,141 to 551 races; the curated `Top_RCV_Races.xlsx` from ~1,350 to ~760.
+**Initial fix** (OE-only): heuristic predicate `_is_likely_multiseat_oe_race` applied inside `_parse_openelections_df`. Dropped the 2025 all-PA workbook from 1,141 to 551 races.
+
+**Generalized fix**: the same predicate (renamed to `_is_likely_multiseat_race`) is now applied universally via `filter_likely_multiseat_races`, called by both `write_workbook` and `write_workbook_pooled_by_category` after the other race-name filters. This catches multi-seat races leaking through *every* source — not just OE. Examples that the OE-only filter missed:
+
+  * `REP School Director MT LEBANON` (Allegheny / WPRDC) — surfaced because WPRDC's 2017 file didn't include `(Vote For N)` metadata for this contest.
+  * `DEM DELEGATES TO THE NATIONAL CONVENTION 17TH DISTRICT` (OE 2020 Primary, 14 candidates) — the previous regex matched only the singular "delegate" because `\bdelegate\b` doesn't match "delegates".
+  * `CONEMAUGH TWP SCH DIR DIRECTORS AT LARGE` — Lycoming-style `SCH DIR` abbreviation wasn't covered by `school director`.
+  * `BRADFORD CITY STUDY COMMISSION` (9 candidates) — Government Study Commissions in PA are 7-9 member elected bodies.
+
+The regex now matches plurals (`directors?`, `delegates?`, `commissioners?`), the `SCH DIR`/`SCH DIRECTORS` abbreviation, study commissions, plus the original County Commissioner / at-large Council / Lycoming `SD` keywords. District-numbered races (`Council District 9`, `School Director District 3 Region 2`) are still explicitly excluded since those are Vote For 1 by region.
+
+The universal filter is intentionally over-eager: it drops a handful of legit Vote For 1 special elections (e.g. "School Director At Large In The Leechburg Area School District 2 Year Term" — a 2-candidate close race) but in exchange we permanently eliminate the dominant class of bogus non-majority findings across every source. Final counts after this pass: `Top_RCV_Races.xlsx` 303 → 242 non-majority races, with the `Crowded fields` sheet now free of delegate / `SCH DIR` / study-commission noise.
 
 ### 15. Electionware percent-column column-eating bug
 

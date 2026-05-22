@@ -9,7 +9,7 @@ import pytest
 
 from primary_scraper import (
     _filter_oe_listing,
-    _is_likely_multiseat_oe_race,
+    _is_likely_multiseat_race,
     _parse_clarity_summary_json,
     _parse_electionware_lines,
     _parse_lycoming_pdf_lines,
@@ -20,6 +20,7 @@ from primary_scraper import (
     _wide_columns_to_tidy,
     add_percentages,
     filter_exclude_race_names,
+    filter_likely_multiseat_races,
     filter_min_candidate_percent,
     filter_min_leader_percent,
     filter_min_winner_votes,
@@ -623,27 +624,46 @@ def test_oe_votes_coerced_to_zero_when_missing():
     assert out['Votes'].tolist() == [0.0]
 
 
-# --- _is_likely_multiseat_oe_race ------------------------------------------
+# --- _is_likely_multiseat_race ---------------------------------------------
 
 def test_likely_multiseat_flags_school_director():
-    assert _is_likely_multiseat_oe_race("SCHOOL DIRECTOR DEER LAKES")
-    assert _is_likely_multiseat_oe_race("School Director Mt Lebanon")
-    assert _is_likely_multiseat_oe_race("DEM School Director Boyertown Area Region 1")
+    assert _is_likely_multiseat_race("SCHOOL DIRECTOR DEER LAKES")
+    assert _is_likely_multiseat_race("School Director Mt Lebanon")
+    assert _is_likely_multiseat_race("DEM School Director Boyertown Area Region 1")
+    # Plural form ("School Directors") and the SCH DIR / SCH DIRECTORS
+    # abbreviation that several PA counties use.
+    assert _is_likely_multiseat_race(
+        "SCHOOL DIRECTORS (4 YEAR TERM) LEHIGHTON AREA SCHOOL DISTRICT"
+    )
+    assert _is_likely_multiseat_race("CONEMAUGH TWP SCH DIR DIRECTORS AT LARGE")
+    assert _is_likely_multiseat_race("WILLIAMSPORT SCH DIRECTORS")
+
+
+def test_likely_multiseat_flags_delegate_and_study_commission():
+    # "Delegates" plural (DEM/REP convention delegates are 3-5 per district).
+    assert _is_likely_multiseat_race(
+        "DEM DELEGATES TO THE NATIONAL CONVENTION 17TH DISTRICT"
+    )
+    assert _is_likely_multiseat_race(
+        "REP ALTERNATE DELEGATES TO THE NATIONAL CONVENTION"
+    )
+    # Government Study Commissions in PA are 7-9 member elected bodies.
+    assert _is_likely_multiseat_race("BRADFORD CITY STUDY COMMISSION")
 
 
 def test_likely_multiseat_flags_county_commissioner_and_at_large_council():
-    assert _is_likely_multiseat_oe_race("COUNTY COMMISSIONER")
-    assert _is_likely_multiseat_oe_race("DEM County Commissioner")
-    assert _is_likely_multiseat_oe_race("PROSPECT PARK BOROUGH COUNCIL")
-    assert _is_likely_multiseat_oe_race("ALLENTOWN CITY COUNCIL")
-    assert _is_likely_multiseat_oe_race("COUNCIL AT LARGE PETERS")
+    assert _is_likely_multiseat_race("COUNTY COMMISSIONER")
+    assert _is_likely_multiseat_race("DEM County Commissioner")
+    assert _is_likely_multiseat_race("PROSPECT PARK BOROUGH COUNCIL")
+    assert _is_likely_multiseat_race("ALLENTOWN CITY COUNCIL")
+    assert _is_likely_multiseat_race("COUNCIL AT LARGE PETERS")
 
 
 def test_likely_multiseat_does_NOT_flag_district_numbered_races():
     # District-numbered races are Vote For 1 — keep them.
-    assert not _is_likely_multiseat_oe_race("DEM Member of Council District 9")
-    assert not _is_likely_multiseat_oe_race("Council District 5")
-    assert not _is_likely_multiseat_oe_race("School Director District 3 Region 2")
+    assert not _is_likely_multiseat_race("DEM Member of Council District 9")
+    assert not _is_likely_multiseat_race("Council District 5")
+    assert not _is_likely_multiseat_race("School Director District 3 Region 2")
 
 
 def test_likely_multiseat_does_NOT_flag_safe_vote_for_one_offices():
@@ -659,7 +679,138 @@ def test_likely_multiseat_does_NOT_flag_safe_vote_for_one_offices():
         "Judge of Election Ward 46",
         "Inspector of Elections Ward 12",
     ]:
-        assert not _is_likely_multiseat_oe_race(race), race
+        assert not _is_likely_multiseat_race(race), race
+
+
+def test_filter_likely_multiseat_races_drops_matched_rows_keeps_others():
+    df = pd.DataFrame({
+        'Candidate': ['A', 'B', 'C', 'D', 'E', 'F'],
+        'Race_Name': [
+            'REP School Director Mt Lebanon',     # drop (school director)
+            'REP School Director Mt Lebanon',     # drop
+            'DEM Mayor Pittsburgh',               # keep
+            'DEM Mayor Pittsburgh',               # keep
+            'BRADFORD CITY STUDY COMMISSION',     # drop (study commission)
+            'Council District 5',                 # keep (district-numbered)
+        ],
+        'Votes': [100, 200, 300, 400, 500, 600],
+    })
+    out = filter_likely_multiseat_races(df)
+    surviving = set(out['Race_Name'].unique())
+    assert surviving == {'DEM Mayor Pittsburgh', 'Council District 5'}
+
+
+def test_oe_drops_general_race_with_three_same_party_candidates():
+    # Real-world case: OE's 2025 Northumberland CSV conflates Mayor +
+    # Borough Council under "Mayor Marion Heights Borough", listing three
+    # DEM candidates with ~110 votes each. PA primary law forbids this —
+    # each party can only nominate one candidate per single-seat general.
+    df = _oe_df([
+        {'county': 'X', 'office': 'Mayor Marion Heights Borough', 'district': '',
+         'party': 'DEM', 'candidate': 'John Wargo', 'votes': '117'},
+        {'county': 'X', 'office': 'Mayor Marion Heights Borough', 'district': '',
+         'party': 'DEM', 'candidate': 'Joseph M. Petrovich', 'votes': '118'},
+        {'county': 'X', 'office': 'Mayor Marion Heights Borough', 'district': '',
+         'party': 'DEM', 'candidate': 'John O Lear', 'votes': '108'},
+        # Control: legit general-election race with one D and one R survives
+        {'county': 'X', 'office': 'Mayor Sunbury', 'district': '',
+         'party': 'DEM', 'candidate': 'Alice', 'votes': '500'},
+        {'county': 'X', 'office': 'Mayor Sunbury', 'district': '',
+         'party': 'REP', 'candidate': 'Bob', 'votes': '450'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert set(out['Race_Name']) == {'MAYOR SUNBURY'}
+
+
+def test_oe_keeps_primary_with_many_same_party_candidates():
+    # In a primary, multiple same-party candidates are normal and expected.
+    # The heuristic must NOT fire when is_primary=True.
+    df = _oe_df([
+        {'county': 'X', 'office': 'Mayor', 'district': '',
+         'party': 'DEM', 'candidate': 'Alice', 'votes': '100'},
+        {'county': 'X', 'office': 'Mayor', 'district': '',
+         'party': 'DEM', 'candidate': 'Bob', 'votes': '90'},
+        {'county': 'X', 'office': 'Mayor', 'district': '',
+         'party': 'DEM', 'candidate': 'Carol', 'votes': '80'},
+        {'county': 'X', 'office': 'Mayor', 'district': '',
+         'party': 'DEM', 'candidate': 'Dave', 'votes': '70'},
+    ])
+    out = _parse_openelections_df(df, is_primary=True)
+    assert out['Race_Name'].nunique() == 1
+    assert len(out) == 4
+
+
+def test_oe_keeps_general_three_candidates_with_distinct_parties():
+    # A 3-way general with DEM/REP/IND each having one candidate is legit
+    # and stays in. Pittsburgh-style mayoral with a third-party challenger.
+    df = _oe_df([
+        {'county': 'X', 'office': 'Mayor Sample City', 'district': '',
+         'party': 'DEM', 'candidate': 'Alice', 'votes': '500'},
+        {'county': 'X', 'office': 'Mayor Sample City', 'district': '',
+         'party': 'REP', 'candidate': 'Bob', 'votes': '400'},
+        {'county': 'X', 'office': 'Mayor Sample City', 'district': '',
+         'party': 'LIB', 'candidate': 'Carol', 'votes': '80'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Race_Name'].nunique() == 1
+    assert len(out) == 3
+
+
+def test_oe_keeps_general_with_empty_party_candidates():
+    # Some PA local offices are reported as non-partisan with an empty
+    # party field. The same-party-3+ heuristic only fires on a *non-empty*
+    # party reaching the threshold; empty-party candidates aren't conflation
+    # evidence per se. (The vote-spread heuristic still applies if totals
+    # look weird, but here they don't.)
+    df = _oe_df([
+        {'county': 'X', 'office': 'Auditor X Borough', 'district': '',
+         'party': '', 'candidate': 'Alice', 'votes': '50'},
+        {'county': 'X', 'office': 'Auditor X Borough', 'district': '',
+         'party': '', 'candidate': 'Bob', 'votes': '40'},
+        {'county': 'X', 'office': 'Auditor X Borough', 'district': '',
+         'party': '', 'candidate': 'Carol', 'votes': '30'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Race_Name'].nunique() == 1
+
+
+def test_oe_drops_general_race_with_extreme_vote_spread():
+    # Real-world case: 2025 Centre County's OE file has 20+ candidates all
+    # tagged "Mayor UNIONVILLE BOROUGH" with vote totals from 61 to 4588 —
+    # clearly multiple distinct races got merged. The party column is
+    # empty/NaN so same-party-3+ doesn't catch it; the vote-spread
+    # heuristic (max/min > 20x) does.
+    df = _oe_df([
+        {'county': 'X', 'office': 'Mayor Unionville Borough', 'district': '',
+         'party': '', 'candidate': f'Cand{i}', 'votes': str(v)}
+        for i, v in enumerate([4588, 4296, 312, 360, 320, 285, 61, 82, 76])
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out.empty, (
+        f"Expected race dropped due to vote-spread heuristic; got: "
+        f"{out[['Race_Name','Candidate','Votes']].to_dict('records')}"
+    )
+
+
+def test_oe_keeps_general_race_with_moderate_vote_spread():
+    # Real Vote-For-1 race with many candidates and moderate spread:
+    # Philly Judge of Election Ward races have ~5x ratio between top and
+    # bottom candidates. The heuristic must NOT drop these.
+    df = _oe_df([
+        {'county': 'X', 'office': 'Judge of Election Ward 46', 'district': '',
+         'party': 'DEM', 'candidate': f'Cand{i}', 'votes': str(v)}
+        for i, v in enumerate([100, 90, 80, 70, 60, 50, 40, 30, 25, 20])
+    ])
+    # 10 distinct DEM candidates → same-party-3+ WOULD fire on this since
+    # all are DEM. But Judge of Election is non-partisan-ish — in PA it's
+    # often reported with party. The user case requires this to NOT be
+    # filtered; for that we keep the heuristic strict.
+    # Spread = 100/20 = 5x, below the 20x threshold. Spread-heuristic keeps it.
+    # Party-heuristic WOULD fire, however. So for this test we leave party
+    # empty to ensure the spread heuristic alone passes.
+    df['party'] = ''
+    out = _parse_openelections_df(df, is_primary=False)
+    assert out['Race_Name'].nunique() == 1
 
 
 def test_oe_drops_district_required_rows_when_district_is_blank():

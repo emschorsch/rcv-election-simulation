@@ -322,17 +322,105 @@ def _parse_openelections_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFra
     # Drop races that look like multi-seat — OE source data doesn't preserve
     # Vote For N, so without this filter School Director / County Commissioner
     # / at-large borough council races get treated as Vote For 1 and surface
-    # as bogus non-majority RCV findings.
-    multiseat = race_name.map(_is_likely_multiseat_oe_race)
+    # as bogus non-majority RCV findings. The same filter is applied
+    # post-pipeline to every source (see filter_likely_multiseat_races);
+    # doing it here too saves a downstream pass over the OE rows.
+    multiseat = race_name.map(_is_likely_multiseat_race)
     df = df[~multiseat].reset_index(drop=True)
     race_name = race_name[~multiseat].reset_index(drop=True)
+    party = party[~multiseat].reset_index(drop=True)
 
     tidy = pd.DataFrame({
         'Candidate': df['_candidate'],
         'Race_Name': race_name,
+        'Party': party,
         'Votes': pd.to_numeric(df['votes'], errors='coerce').fillna(0),
     })
-    return tidy.groupby(['Race_Name', 'Candidate'], as_index=False)['Votes'].sum()
+    # Aggregate by (race, candidate). Party is collapsed via mode — when the
+    # same candidate appears across multiple counties, take the most common
+    # party label they were reported under.
+    grouped = (
+        tidy.groupby(['Race_Name', 'Candidate'], as_index=False)
+        .agg({'Votes': 'sum', 'Party': lambda s: _most_common(s)})
+    )
+
+    # General-election sanity checks. Two heuristics, applied only for
+    # non-primary OE data:
+    #
+    # 1) 3+ same-party candidates: under PA primary law each party gets at
+    #    most one nominee per single-seat office, so this is essentially
+    #    impossible and signals an OE conflation (e.g., Mayor + Borough
+    #    Council fused under one office name, as in 2025 Northumberland).
+    #
+    # 2) Extreme vote-spread (max/min > 20x): real single-seat races have
+    #    candidates whose totals are within roughly an order of magnitude
+    #    of each other; a 75x spread (as in 2025 Centre's "Mayor UNIONVILLE
+    #    BOROUGH" where 20 candidates from clearly-different actual races
+    #    got merged) means rows from multiple distinct races were lumped
+    #    together. Catches cases where party info is empty so heuristic
+    #    (1) can't fire.
+    if not is_primary:
+        bad_races = (
+            _races_with_too_many_same_party(grouped, threshold=3)
+            | _races_with_extreme_vote_spread(grouped, max_ratio=20.0)
+        )
+        if bad_races:
+            grouped = grouped[~grouped['Race_Name'].isin(bad_races)]
+
+    return grouped[['Race_Name', 'Candidate', 'Votes']]
+
+
+def _most_common(s: pd.Series) -> str:
+    """Return the most common value in a Series, or '' if empty."""
+    m = s.mode()
+    return m.iloc[0] if not m.empty else ''
+
+
+def _races_with_too_many_same_party(
+    grouped: pd.DataFrame, *, threshold: int = 3,
+) -> set[str]:
+    """Set of race names where some non-empty party has `threshold`+ distinct
+    candidates. PA general elections legally cap each party at one nominee
+    per single-seat office, so this signals upstream conflation.
+    """
+    bad: set[str] = set()
+    for race, g in grouped.groupby('Race_Name'):
+        non_empty = g[g['Party'].astype(str) != '']
+        if non_empty.empty:
+            continue
+        counts = non_empty['Party'].value_counts()
+        if (counts >= threshold).any():
+            bad.add(race)
+    return bad
+
+
+def _races_with_extreme_vote_spread(
+    grouped: pd.DataFrame, *,
+    max_ratio: float = 20.0,
+    min_candidates: int = 5,
+) -> set[str]:
+    """Set of race names where max candidate votes / min candidate votes
+    exceeds `max_ratio` AND the race has at least `min_candidates`. Real
+    single-seat races with many candidates have a graceful decay; a 20x+
+    spread across 5+ candidates signals multiple distinct races got merged
+    into one office name upstream (as in 2025 Centre's Unionville Borough
+    case, where 20+ candidates spanned 61–4588 votes).
+
+    The 5-candidate minimum prevents flagging legitimate 2-or-3-candidate
+    races with a dominant winner and one minor-party challenger; those can
+    easily span 20x without being conflated. Considers only candidates
+    with strictly positive vote counts.
+    """
+    bad: set[str] = set()
+    for race, g in grouped.groupby('Race_Name'):
+        positive = g[g['Votes'].astype(float) > 0]
+        if len(positive) < min_candidates:
+            continue
+        v_min = float(positive['Votes'].min())
+        v_max = float(positive['Votes'].max())
+        if v_min > 0 and (v_max / v_min) > max_ratio:
+            bad.add(race)
+    return bad
 
 
 def _coverage_from_counties(df: pd.DataFrame, expected: int = 67) -> str:
@@ -359,23 +447,56 @@ _NEEDS_DISTRICT_OFFICES = frozenset({'STATE HOUSE', 'STATE SENATE', 'U.S. HOUSE'
 #
 # A district-numbered race (e.g. "Member of Council District 9") is the
 # exception — those are Vote For 1 and we keep them.
-_OE_LIKELY_MULTISEAT_OFFICES_RE = re.compile(
-    r"\b(?:school director|school board"
-    r"|county commissioner|county council at[-\s]large"
-    r"|borough council|township council|city council"
-    r"|council at[-\s]large|council member city|council \(?at[-\s]large\)?)\b",
+# Multi-seat office-name patterns in PA. School Director and School Board
+# elect 4+ directors per district (also written "SCH DIR", "SCH DIRS",
+# "SCHOOL DIRECTORS"). County Commissioner is Vote For 2 by law.
+# "Delegate" (national/state convention) is always 3-5 per district.
+# "Study Commission" is a 7-9 member elected body. "SD" is the shorthand
+# Lycoming uses for School District in "<district> SD".
+_LIKELY_MULTISEAT_KEYWORDS_RE = re.compile(
+    r"\b(?:"
+    r"(?:school|sch\.?)\s+(?:directors?|dirs?|boards?)"
+    r"|county commissioners?"
+    r"|delegates?"
+    r"|study commissions?"
+    r")\b",
     re.IGNORECASE,
 )
+_COUNCIL_RE = re.compile(r"\bcouncil\b", re.IGNORECASE)
+_SD_ABBREV_RE = re.compile(r"\bsd\b", re.IGNORECASE)
+# District-numbered race (e.g. "Council District 9") — Vote For 1.
 _DISTRICT_NUMBERED_RE = re.compile(r"\bdistrict\s+\d", re.IGNORECASE)
 
 
-def _is_likely_multiseat_oe_race(race_name: str) -> bool:
-    """True if this OE-sourced race looks like a multi-seat (Vote For N>1)
-    contest we can't detect directly. District-numbered races (Vote For 1)
-    are explicitly excluded from this check."""
+def _is_likely_multiseat_race(race_name: str) -> bool:
+    """True if the race name looks like a multi-seat (Vote For N>1) contest.
+
+    Source-agnostic — we apply this universally because OE, WPRDC, and
+    Clarity data don't preserve Vote For N, so without this filter
+    multi-seat races get treated as Vote For 1 and produce bogus
+    non-majority RCV findings.
+
+    Heuristic: any "Council" race in PA without a district number is
+    at-large multi-seat (3-5 council seats per borough/township/city,
+    voters pick multiple). Plus the specific multi-seat keywords
+    (school director(s), county commissioner, delegate, study commission)
+    and the "SD" abbreviation Lycoming uses. District-numbered races
+    (Vote For 1 by region) are explicitly excluded.
+    """
     if _DISTRICT_NUMBERED_RE.search(race_name):
         return False
-    return bool(_OE_LIKELY_MULTISEAT_OFFICES_RE.search(race_name))
+    if _LIKELY_MULTISEAT_KEYWORDS_RE.search(race_name):
+        return True
+    if _COUNCIL_RE.search(race_name):
+        return True
+    if _SD_ABBREV_RE.search(race_name):
+        return True
+    return False
+
+
+# Backwards-compatible alias for the (previously OE-only) name. Tests and
+# OE-internal code still import this; the function itself is source-agnostic.
+_is_likely_multiseat_oe_race = _is_likely_multiseat_race
 
 
 @dataclass(kw_only=True)
@@ -1096,6 +1217,22 @@ def filter_exclude_race_names(df: pd.DataFrame, pattern: Optional[str]) -> pd.Da
     return df[~mask].copy()
 
 
+def filter_likely_multiseat_races(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop races whose names look like Vote For N>1 contests.
+
+    Source-agnostic — applied to every parsed source because none of our
+    data sources (OE, WPRDC, Clarity, Electionware/Boyer PDFs, Berks LLM
+    extracts) preserve Vote For N. Without this filter, school director,
+    county commissioner, at-large council, delegates, and study-commission
+    races get treated as Vote For 1 and surface as bogus non-majority
+    findings (e.g. "leader has 23.78%" for a 5-candidate Vote For 4 race).
+    """
+    if df.empty or 'Race_Name' not in df.columns:
+        return df
+    mask = df['Race_Name'].astype(str).map(_is_likely_multiseat_race)
+    return df[~mask].copy()
+
+
 def format_for_sheet(df: pd.DataFrame) -> pd.DataFrame:
     """Return Candidate/Race_Name/Votes/Percent sorted with a blank row between races."""
     df = df[['Candidate', 'Race_Name', 'Votes', 'Percent']].copy()
@@ -1137,6 +1274,7 @@ def write_workbook(
             tidy = filter_min_candidate_percent(tidy, min_percent=min_candidate_percent)
             tidy = filter_race_names(tidy, race_pattern)
             tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
+            tidy = filter_likely_multiseat_races(tidy)
             sheet = format_for_sheet(tidy)
             sheet.to_excel(writer, sheet_name=source.name, index=False)
 
@@ -1214,6 +1352,7 @@ def write_workbook_pooled_by_category(
         tidy = filter_min_candidate_percent(tidy, min_percent=min_candidate_percent)
         tidy = filter_race_names(tidy, race_pattern)
         tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
+        tidy = filter_likely_multiseat_races(tidy)
         race_count = tidy['Race_Name'].nunique() if not tidy.empty else 0
         print(f"  -> {race_count} non-majority races")
         by_cat.setdefault(source.category, []).append((source, tidy))
