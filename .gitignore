@@ -6,8 +6,10 @@ __pycache__/
 # Safe to delete; will be re-fetched (and re-billed) on next run.
 .cache/
 
-# Generated election workbooks (root-level outputs of primary_scraper.py)
-/*.xlsx
+# Note: the generated election workbooks (Top_RCV_Races.xlsx and the five
+# per-source files) used to be ignored, but are now tracked so anyone
+# cloning the repo can read the curated findings without re-running the
+# whole pipeline. Regeneration overwrites them in place.
 
 # Editor / IDE
 .idea/

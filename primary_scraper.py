@@ -1578,6 +1578,136 @@ _PA_STATE_FEDERAL_RACE_EXCLUDE = (
 )
 
 
+# --- Curated top-races workbook --------------------------------------------
+
+# Office-name keywords that flag a race as "notable local" for the curated
+# view (mayor, council, DA, sheriff, controllers, county exec, etc.).
+_NOTABLE_LOCAL_OFFICE_RE = re.compile(
+    r"\b(?:mayor|council|district attorney|sheriff|controller|chief executive"
+    r"|county executive|county commissioner|judge of the court of common pleas"
+    r"|magisterial district judge|tax collector|township supervisor)\b",
+    re.IGNORECASE,
+)
+
+
+def _race_summary(group: pd.DataFrame) -> dict:
+    """Compress one race's rows into a single summary record.
+
+    Sorts candidates by votes desc, captures top three candidate names + %,
+    the gap between top two, total candidate count, and a `Candidates Inline`
+    string with every candidate listed.
+    """
+    g = group.sort_values('Votes', ascending=False).reset_index(drop=True)
+    leader = g.iloc[0] if len(g) >= 1 else None
+    runner = g.iloc[1] if len(g) >= 2 else None
+    third = g.iloc[2] if len(g) >= 3 else None
+    inline = ', '.join(
+        f"{r['Candidate']} {r['Percent']:.1f}%" for _, r in g.iterrows()
+    )
+    return {
+        'Year': leader['Year'] if 'Year' in g.columns and leader is not None else '',
+        'Workbook': leader.get('Workbook', '') if leader is not None else '',
+        'Coverage': leader.get('Coverage', '') if leader is not None else '',
+        'Race_Name': leader['Race_Name'] if leader is not None else '',
+        'Num_Candidates': len(g),
+        'Leader': leader['Candidate'] if leader is not None else '',
+        'Leader %': round(float(leader['Percent']), 2) if leader is not None else None,
+        'Runner-Up': runner['Candidate'] if runner is not None else '',
+        'Runner-Up %': round(float(runner['Percent']), 2) if runner is not None else None,
+        'Third': third['Candidate'] if third is not None else '',
+        'Third %': round(float(third['Percent']), 2) if third is not None else None,
+        'Top-2 Gap': (
+            round(float(leader['Percent']) - float(runner['Percent']), 2)
+            if runner is not None else None
+        ),
+        'Candidates Inline': inline,
+    }
+
+
+def _read_all_non_majority_rows(workbooks: list[str]) -> pd.DataFrame:
+    """Read every per-workbook output file and return a unified frame.
+
+    Tags each row with its `Workbook` source so the curated view can show
+    which jurisdiction it came from. Drops blank separator rows.
+    """
+    frames = []
+    for wb in workbooks:
+        if not Path(wb).exists():
+            print(f"  (skipping {wb} — not found)")
+            continue
+        sheets = pd.read_excel(wb, sheet_name=None)
+        for sheet_name, df in sheets.items():
+            if df.empty or 'Race_Name' not in df.columns:
+                continue
+            df = df[df['Race_Name'].astype(str) != ''].copy()
+            df['Workbook'] = wb
+            df['Sheet'] = sheet_name
+            # Per-source workbooks (Philly) don't have a Year column; default to
+            # the sheet name (which is the year, e.g., "2007").
+            if 'Year' not in df.columns:
+                df['Year'] = sheet_name
+            if 'Coverage' not in df.columns:
+                df['Coverage'] = ''
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def make_top_races_workbook(
+    workbooks: list[str],
+    out_path: str = "Top_RCV_Races.xlsx",
+) -> None:
+    """Build a curated workbook from the per-source outputs.
+
+    Sheets, each one row per race:
+      1. **Closest two-way races** — sorted by gap between top two asc.
+      2. **Crowded fields** — 4+ candidates with leader under 40%, sorted by
+         leader % asc (most fragmented first).
+      3. **Notable local offices** — mayor / council / DA / sheriff / etc.
+      4. **All non-majority races** — every race from every workbook.
+    """
+    all_rows = _read_all_non_majority_rows(workbooks)
+    if all_rows.empty:
+        print("  (no rows found — workbooks haven't been generated yet)")
+        return
+
+    # One row per race summary
+    summaries = []
+    for _, group in all_rows.groupby(['Workbook', 'Sheet', 'Year', 'Race_Name'],
+                                      sort=False):
+        summaries.append(_race_summary(group))
+    races = pd.DataFrame(summaries)
+
+    # Sheet 1: closest two-way
+    close = (
+        races[races['Top-2 Gap'].notna() & (races['Top-2 Gap'] <= 5.0)]
+        .sort_values('Top-2 Gap')
+    )
+
+    # Sheet 2: crowded fields
+    crowded = (
+        races[(races['Num_Candidates'] >= 4) & (races['Leader %'] < 40.0)]
+        .sort_values('Leader %')
+    )
+
+    # Sheet 3: notable local offices
+    notable = (
+        races[races['Race_Name'].astype(str).str.contains(
+            _NOTABLE_LOCAL_OFFICE_RE, na=False)]
+        .sort_values(['Leader %', 'Num_Candidates'], ascending=[True, False])
+    )
+
+    # Sheet 4: everything
+    full = races.sort_values(['Workbook', 'Year', 'Race_Name'])
+
+    with pd.ExcelWriter(out_path, engine='xlsxwriter') as writer:
+        close.to_excel(writer, sheet_name='Closest two-way', index=False)
+        crowded.to_excel(writer, sheet_name='Crowded fields', index=False)
+        notable.to_excel(writer, sheet_name='Notable local offices', index=False)
+        full.to_excel(writer, sheet_name='All non-majority races', index=False)
+
+
 # --- Entry point ------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -1626,3 +1756,11 @@ if __name__ == "__main__":
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
     print(f"Saved mid-counties workbook to '{mid_out}'")
+
+    # --- Curated top-races view across every workbook above ---
+    top_out = "Top_RCV_Races.xlsx"
+    make_top_races_workbook(
+        workbooks=[philly_out, pa_out, ac_out, pa_local_out, mid_out],
+        out_path=top_out,
+    )
+    print(f"Saved curated top-races workbook to '{top_out}'")
