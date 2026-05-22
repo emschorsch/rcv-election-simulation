@@ -9,6 +9,7 @@ import pytest
 
 from primary_scraper import (
     _filter_oe_listing,
+    _is_likely_multiseat_oe_race,
     _parse_clarity_summary_json,
     _parse_electionware_lines,
     _parse_lycoming_pdf_lines,
@@ -620,6 +621,45 @@ def test_oe_votes_coerced_to_zero_when_missing():
     ])
     out = _parse_openelections_df(df, is_primary=False)
     assert out['Votes'].tolist() == [0.0]
+
+
+# --- _is_likely_multiseat_oe_race ------------------------------------------
+
+def test_likely_multiseat_flags_school_director():
+    assert _is_likely_multiseat_oe_race("SCHOOL DIRECTOR DEER LAKES")
+    assert _is_likely_multiseat_oe_race("School Director Mt Lebanon")
+    assert _is_likely_multiseat_oe_race("DEM School Director Boyertown Area Region 1")
+
+
+def test_likely_multiseat_flags_county_commissioner_and_at_large_council():
+    assert _is_likely_multiseat_oe_race("COUNTY COMMISSIONER")
+    assert _is_likely_multiseat_oe_race("DEM County Commissioner")
+    assert _is_likely_multiseat_oe_race("PROSPECT PARK BOROUGH COUNCIL")
+    assert _is_likely_multiseat_oe_race("ALLENTOWN CITY COUNCIL")
+    assert _is_likely_multiseat_oe_race("COUNCIL AT LARGE PETERS")
+
+
+def test_likely_multiseat_does_NOT_flag_district_numbered_races():
+    # District-numbered races are Vote For 1 — keep them.
+    assert not _is_likely_multiseat_oe_race("DEM Member of Council District 9")
+    assert not _is_likely_multiseat_oe_race("Council District 5")
+    assert not _is_likely_multiseat_oe_race("School Director District 3 Region 2")
+
+
+def test_likely_multiseat_does_NOT_flag_safe_vote_for_one_offices():
+    # Mayor, magistrate, DA, controller, supervisor, tax collector, judge of
+    # election, inspector of election — all Vote For 1 in PA.
+    for race in [
+        "DEM Mayor Pittsburgh",
+        "REP Magisterial District Judge 19-3-09",
+        "District Attorney",
+        "Controller",
+        "Township Supervisor Lower Milford",
+        "Tax Collector Wayne Twp",
+        "Judge of Election Ward 46",
+        "Inspector of Elections Ward 12",
+    ]:
+        assert not _is_likely_multiseat_oe_race(race), race
 
 
 def test_oe_drops_district_required_rows_when_district_is_blank():

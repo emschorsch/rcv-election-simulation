@@ -319,6 +319,14 @@ def _parse_openelections_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFra
         race_name = office + ' ' + district
     race_name = race_name.str.replace(r'\s+', ' ', regex=True).str.strip()
 
+    # Drop races that look like multi-seat — OE source data doesn't preserve
+    # Vote For N, so without this filter School Director / County Commissioner
+    # / at-large borough council races get treated as Vote For 1 and surface
+    # as bogus non-majority RCV findings.
+    multiseat = race_name.map(_is_likely_multiseat_oe_race)
+    df = df[~multiseat].reset_index(drop=True)
+    race_name = race_name[~multiseat].reset_index(drop=True)
+
     tidy = pd.DataFrame({
         'Candidate': df['_candidate'],
         'Race_Name': race_name,
@@ -339,6 +347,35 @@ def _coverage_from_counties(df: pd.DataFrame, expected: int = 67) -> str:
 # Philadelphia's 2024 State House rows have blank district, which would merge
 # 27+ unrelated reps into one entry).
 _NEEDS_DISTRICT_OFFICES = frozenset({'STATE HOUSE', 'STATE SENATE', 'U.S. HOUSE'})
+
+
+# OpenElections strips the `(Vote For N)` metadata when converting source PDFs
+# to their tidy county CSVs. That means we can't tell multi-seat races from
+# single-seat ones in OE data. These office-name patterns are *almost always*
+# multi-seat in PA — School Director seats are by region (3-9 candidates
+# typically competing for 4 seats); County Commissioner is Vote For 2 by law
+# (3 commissioners, vote for at most 2 to ensure minority representation);
+# at-large borough/city/township councils are usually Vote For 3+.
+#
+# A district-numbered race (e.g. "Member of Council District 9") is the
+# exception — those are Vote For 1 and we keep them.
+_OE_LIKELY_MULTISEAT_OFFICES_RE = re.compile(
+    r"\b(?:school director|school board"
+    r"|county commissioner|county council at[-\s]large"
+    r"|borough council|township council|city council"
+    r"|council at[-\s]large|council member city|council \(?at[-\s]large\)?)\b",
+    re.IGNORECASE,
+)
+_DISTRICT_NUMBERED_RE = re.compile(r"\bdistrict\s+\d", re.IGNORECASE)
+
+
+def _is_likely_multiseat_oe_race(race_name: str) -> bool:
+    """True if this OE-sourced race looks like a multi-seat (Vote For N>1)
+    contest we can't detect directly. District-numbered races (Vote For 1)
+    are explicitly excluded from this check."""
+    if _DISTRICT_NUMBERED_RE.search(race_name):
+        return False
+    return bool(_OE_LIKELY_MULTISEAT_OFFICES_RE.search(race_name))
 
 
 @dataclass(kw_only=True)
