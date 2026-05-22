@@ -1627,6 +1627,24 @@ _NOTABLE_LOCAL_OFFICE_RE = re.compile(
 )
 
 
+def _sheet_to_election_type(sheet_name: str, workbook: str) -> str:
+    """Derive Primary vs General from the source sheet name / workbook.
+
+    Pooled-by-category workbooks split into 'Primaries' / 'Generals' sheets,
+    so the sheet name carries the type. Philly's workbook uses year-named
+    sheets but is primary-only — fall back to the filename.
+    """
+    if sheet_name == 'Primaries':
+        return 'Primary'
+    if sheet_name == 'Generals':
+        return 'General'
+    if 'Primary' in workbook:
+        return 'Primary'
+    if 'General' in workbook:
+        return 'General'
+    return ''
+
+
 def _race_summary(group: pd.DataFrame) -> dict:
     """Compress one race's rows into a single summary record.
 
@@ -1643,6 +1661,7 @@ def _race_summary(group: pd.DataFrame) -> dict:
     )
     return {
         'Year': leader['Year'] if 'Year' in g.columns and leader is not None else '',
+        'Election Type': leader.get('Election Type', '') if leader is not None else '',
         'Workbook': leader.get('Workbook', '') if leader is not None else '',
         'Coverage': leader.get('Coverage', '') if leader is not None else '',
         'Race_Name': leader['Race_Name'] if leader is not None else '',
@@ -1664,8 +1683,10 @@ def _race_summary(group: pd.DataFrame) -> dict:
 def _read_all_non_majority_rows(workbooks: list[str]) -> pd.DataFrame:
     """Read every per-workbook output file and return a unified frame.
 
-    Tags each row with its `Workbook` source so the curated view can show
-    which jurisdiction it came from. Drops blank separator rows.
+    Tags each row with its `Workbook` source, `Election Type`
+    (Primary/General derived from sheet name + filename), and `Coverage`
+    so the curated view can show which jurisdiction and contest cycle
+    it came from. Drops blank separator rows.
     """
     frames = []
     for wb in workbooks:
@@ -1679,6 +1700,7 @@ def _read_all_non_majority_rows(workbooks: list[str]) -> pd.DataFrame:
             df = df[df['Race_Name'].astype(str) != ''].copy()
             df['Workbook'] = wb
             df['Sheet'] = sheet_name
+            df['Election Type'] = _sheet_to_election_type(sheet_name, wb)
             # Per-source workbooks (Philly) don't have a Year column; default to
             # the sheet name (which is the year, e.g., "2007").
             if 'Year' not in df.columns:
