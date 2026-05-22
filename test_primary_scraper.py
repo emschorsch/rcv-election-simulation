@@ -899,6 +899,24 @@ def test_filter_oe_listing_ignores_non_file_entries():
     assert out == ['20251104__pa__general__adams__county.csv']
 
 
+def test_filter_oe_listing_skips_excluded_county_substrings():
+    # Used to bypass OE for counties whose OE-parsed data has known
+    # conflation bugs (Northumberland 2025 conflates Mayor + Borough Council).
+    listing = [
+        _listing_entry('20251104__pa__general__adams__county.csv'),
+        _listing_entry('20251104__pa__general__northumberland__county.csv'),
+        _listing_entry('20251104__pa__general__berks__county.csv'),
+    ]
+    out = _filter_oe_listing(
+        listing, substr='__general__', suffix='__county.csv',
+        exclude_substrs=('__northumberland__',),
+    )
+    assert out == [
+        '20251104__pa__general__adams__county.csv',
+        '20251104__pa__general__berks__county.csv',
+    ]
+
+
 def test_wprdc_aggregates_duplicate_candidate_rows_within_race():
     # Defensive: if a file somehow has two rows for the same (race, candidate),
     # they should sum rather than duplicate.

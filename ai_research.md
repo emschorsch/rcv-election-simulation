@@ -162,7 +162,15 @@ Delaware's Clarity export prefixes candidate names with a numeric row ID: `"(112
 
 **Fix**: added `_CANDIDATE_ID_PREFIX_RE = r'^\(\d+\)\s*'` to `_normalize_candidate`. Strips the prefix early so the same person collapses to one row regardless of which party line they appeared on.
 
-### 13. Multi-seat OE races masquerading as Vote-For-1
+### 13. Per-county OE conflation bugs (Northumberland Mayor Marion Heights)
+
+Surfaced when a spot-check noticed `MAYOR MARION HEIGHTS BOROUGH` (Northumberland County, 2025 General) in the curated top-races output. The actual November 2025 PDF lists exactly one candidate (DEM John Wargo, 105 votes) — the race was unopposed. But OpenElections' 2025 Northumberland CSV groups three candidates under that office name (Wargo + Joseph Petrovich + John O Lear, all DEM, ~110 votes each). Petrovich and OLear are actually Borough *Council* winners from the next race on the page; OE's parser apparently failed to detect the section boundary between Mayor and Borough Council.
+
+**Fix**: route around the OE bug by using the source PDF directly. Added `filename_exclude_substrs` to `StitchedOpenElectionsCountiesSource` so we can skip specific counties from the OE 2025 stitch; Northumberland 2025 General is then ingested via the existing `ElectionwarePdfSource` pointed at Northumberland's official `overall.pdf`. The direct parse correctly identifies Wargo as the sole listed candidate (filtered as a majority winner) and also surfaces a real finding the OE bug had been masking: the 2025 Sunbury City Council 50/50 tie (Rosancrans D / Ramos R, 752 votes each).
+
+This isn't a fully general fix — other PA counties may have similar OE-parsing bugs. A broader heuristic (drop OE general-election Vote-For-1 races with 3+ same-party candidates, since PA primary law makes that essentially impossible) is deferred until we encounter more cases; it would require preserving party info through the pipeline, a moderate refactor.
+
+### 14. Multi-seat OE races masquerading as Vote-For-1
 
 Surfaced when a spot-check flagged `SCHOOL DIRECTOR DEER LAKES` (Allegheny, 2025) in the curated top-races output. WPRDC has the same race as `"School Director Deer Lakes (Vote For 4)"` — voters pick 4 of 5 candidates and the top 4 win. OpenElections strips the `(Vote For N)` metadata when converting county PDFs to their tidy CSVs, so `_parse_openelections_df` had no way to know it was multi-seat; the five candidates at ~20% each looked like a wide-open Vote For 1 race.
 
@@ -170,19 +178,19 @@ This was inflating the 2025 all-PA workbook significantly: 389 SCHOOL DIRECTOR r
 
 **Fix**: heuristic filter `_is_likely_multiseat_oe_race` that flags office names which are almost always multi-seat in PA — School Director / School Board, County Commissioner (Vote For 2 by law), at-large Borough/City/Township Council. District-numbered races (`"Council District 9"`) are explicitly excluded from the filter since those are Vote For 1. Applied only inside `_parse_openelections_df`; the WPRDC and Clarity sources preserve `(Vote For N)` correctly and don't need this. Dropped the 2025 all-PA workbook from 1,141 to 551 races; the curated `Top_RCV_Races.xlsx` from ~1,350 to ~760.
 
-### 14. Electionware percent-column column-eating bug
+### 15. Electionware percent-column column-eating bug
 
 When extending the parser from Berks to Chester, we discovered Chester 2021 PDFs include a `VOTE %` column between TOTAL and Election Day (e.g., `"MARIA MCLAUGHLIN  42,302  99.33%  23,107  19,055   140"`). The original regex `(.+?)\s{2,}([\d,]+)…` greedily backtracked: it expanded the non-greedy name capture to include the actual total and the percent, then captured the Election Day count as "TOTAL". The result was ~5,800 corrupt candidate rows from one PDF.
 
 **Fix**: tightened the name capture to `[A-Za-z][^\d%]*?` (must start with a letter, may not contain digits or `%`). The first numeric column after the name is then unambiguously TOTAL. The trailing column class was widened to `[\d,%.]+` to accept the percent column harmlessly. Added a `test_electionware_handles_layout_with_percent_column` regression test so we don't backslide. Also added `TOTAL VOTES CAST` to `_NON_CANDIDATE_NAMES` to drop the per-contest totals row Chester emits.
 
-### 15. System Python SSL cert store sometimes lacks intermediate certs
+### 16. System Python SSL cert store sometimes lacks intermediate certs
 
 Surfaced when fetching PDFs directly from county sites (berkspa.gov): plain `urllib.request.urlopen` failed with `SSLCertVerificationError: unable to get local issuer certificate`, while the same `curl` and `pandas.read_csv` calls worked because they use bundled CA stores. The system Python's default trust store didn't accept the county's cert chain.
 
 **Fix**: `_extract_electionware_pdf` builds an `ssl.create_default_context(cafile=certifi.where())` and passes it to `urlopen`. `certifi` is already a transitive dep via `pandas`. Only applies to the PDF download path; other `urllib` calls (GitHub API) happen to work without it.
 
-### 16. Removing write-ins changes majority math
+### 17. Removing write-ins changes majority math
 
 After tightening the write-in filter, some races that previously looked non-majority (e.g., 49.8% vs 49.5% vs 0.7% write-ins) flipped to majority once write-ins were dropped (49.8/99.3 ≈ 50.15%). This is actually the correct IRV interpretation — under IRV, eliminated write-ins don't transfer further, so the remaining candidates compete for the reduced pool. The previously-surfaced 50/50 Delaware races correctly disappeared.
 

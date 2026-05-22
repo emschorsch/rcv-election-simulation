@@ -411,6 +411,7 @@ class StitchedOpenElectionsCountiesSource(ElectionSource):
     raw_base_url: str = ""
     filename_substr: str = ""
     filename_suffix: str = ""
+    filename_exclude_substrs: tuple[str, ...] = ()
     is_primary: bool = False
     expected_counties: int = 67
 
@@ -447,23 +448,33 @@ class StitchedOpenElectionsCountiesSource(ElectionSource):
             raise RuntimeError(
                 f"Unexpected listing response from {self.listing_api_url}: {data!r}"
             )
-        return _filter_oe_listing(data, self.filename_substr, self.filename_suffix)
+        return _filter_oe_listing(
+            data, self.filename_substr, self.filename_suffix,
+            self.filename_exclude_substrs,
+        )
 
 
 def _filter_oe_listing(
     listing: list[dict],
     substr: str,
     suffix: str,
+    exclude_substrs: tuple[str, ...] = (),
 ) -> list[str]:
     """Filter a GitHub Contents API listing to file entries whose `name`
-    contains `substr` AND ends with `suffix`. Returns sorted file names.
-    Extracted from `StitchedOpenElectionsCountiesSource._list_matching_files`
-    so the filter logic can be unit-tested without mocking HTTP."""
+    contains `substr` AND ends with `suffix` AND doesn't contain any
+    `exclude_substrs`. Returns sorted file names.
+
+    `exclude_substrs` lets us skip specific counties whose OE-parsed data
+    has known conflation bugs (e.g., the 2025 Northumberland file groups
+    Mayor + Borough Council candidates under one office name); we fetch
+    those counties from the source PDF directly instead.
+    """
     return sorted(
         d['name'] for d in listing
         if d.get('type') == 'file'
            and substr in d.get('name', '')
            and d.get('name', '').endswith(suffix)
+           and not any(ex in d.get('name', '') for ex in exclude_substrs)
     )
 
 
@@ -1350,6 +1361,11 @@ PA_LOCAL_2025_SOURCES: list[ElectionSource] = [
         raw_base_url=_OE_RAW + "2025/counties/",
         filename_substr="__general__",
         filename_suffix="__county.csv",
+        # Skip counties whose OE-parsed data has known conflation bugs;
+        # those counties are integrated separately via their source PDFs
+        # (see ELECTIONWARE_PDF_SOURCES). Northumberland: OE's 2025 file
+        # groups Mayor + Borough Council candidates under one office name.
+        filename_exclude_substrs=("__northumberland__",),
     ),
 ]
 
@@ -1533,6 +1549,15 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         name="2025 Northumberland Primary", year=2025, category="Primaries", is_primary=True,
         coverage_note="Northumberland County (Sunbury + Shamokin + boroughs)",
         url=_NUMCO_PDF_BASE + "2025_0520_official/overall.pdf",
+    ),
+    # Northumberland 2025 GENERAL — replaces the OE-stitched version of
+    # the same data, which has a known conflation bug (Mayor + Borough
+    # Council candidates grouped under one office name). Excluded from
+    # the OE 2025 stitch via `filename_exclude_substrs` above.
+    ElectionwarePdfSource(
+        name="2025 Northumberland General", year=2025, category="Generals",
+        coverage_note="Northumberland County (Sunbury + Shamokin + boroughs)",
+        url=_NUMCO_PDF_BASE + "2025_1104_official/overall.pdf",
     ),
     # Indiana County (Indiana + boroughs + townships). Only 2025 PDF URL
     # was readily discoverable; older years require drilling.
