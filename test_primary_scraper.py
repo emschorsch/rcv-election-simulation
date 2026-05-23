@@ -21,6 +21,7 @@ from primary_scraper import (
     add_percentages,
     filter_exclude_race_names,
     filter_likely_multiseat_races,
+    filter_write_in_fragmentation,
     filter_min_candidate_percent,
     filter_min_leader_percent,
     filter_min_winner_votes,
@@ -546,6 +547,64 @@ def test_fuzzy_canonicalize_empty_input_returns_empty():
     df = pd.DataFrame(columns=['Race_Name', 'Candidate', 'Votes'])
     out = fuzzy_canonicalize_candidates(df)
     assert len(out) == 0
+
+
+def test_fuzzy_canonicalize_merges_nickname_short_for_variants():
+    # Write-ins for the same person under different first-name spellings.
+    # Real-world York 2025 case: "GREG BOWER" + "GREGORY BOWER" (same person),
+    # "CLIFF ACKMAN" + "CLIFFORD ACKMAN" (same person), plus a last-name-only
+    # write-in for the same person.
+    df = pd.DataFrame({
+        "Race_Name": ["X"] * 5,
+        "Candidate": ["GREGORY BOWER", "GREG BOWER", "CLIFFORD ACKMAN",
+                       "CLIFF ACKMAN", "BOWER"],
+        "Votes": [2156.0, 800.0, 802.0, 130.0, 50.0],
+    })
+    out = fuzzy_canonicalize_candidates(df)
+    totals = dict(zip(out['Candidate'], out['Votes']))
+    # GREGORY BOWER wins (highest votes), absorbs GREG BOWER + last-name-only BOWER.
+    assert totals.get("GREGORY BOWER") == 2156.0 + 800.0 + 50.0
+    # CLIFFORD ACKMAN wins, absorbs CLIFF ACKMAN.
+    assert totals.get("CLIFFORD ACKMAN") == 802.0 + 130.0
+
+
+def test_fuzzy_canonicalize_does_not_merge_same_last_unrelated_first():
+    # "JOHN SMITH" and "JANE SMITH" are real different people. Same last
+    # name but no prefix relationship in first names — must stay separate.
+    df = pd.DataFrame({
+        "Race_Name": ["X", "X"],
+        "Candidate": ["JOHN SMITH", "JANE SMITH"],
+        "Votes": [200.0, 150.0],
+    })
+    out = fuzzy_canonicalize_candidates(df)
+    assert set(out['Candidate']) == {"JOHN SMITH", "JANE SMITH"}
+
+
+def test_filter_write_in_fragmentation_drops_extreme_leader_ratio():
+    # Uncontested DEM primary where voters wrote in the unopposed Republican
+    # incumbent's name (Sheriff Keuerleber 29.84% / nearest other write-in
+    # Becker 4.03%).
+    df = pd.DataFrame({
+        "Race_Name": ["DEM Sheriff"] * 3 + ["DEM Mayor Allentown"] * 3,
+        "Candidate": ["KEUERLEBER", "BECKER", "OTHER",
+                       "TUERK", "OCONNELL", "GURIDY"],
+        "Percent": [29.84, 4.03, 2.0, 26.63, 25.06, 24.86],
+        "Votes": [200.0, 30.0, 10.0, 2100.0, 2000.0, 1900.0],
+    })
+    out = filter_write_in_fragmentation(df)
+    assert set(out['Race_Name']) == {"DEM Mayor Allentown"}
+
+
+def test_filter_write_in_fragmentation_keeps_real_close_races():
+    # Real competitive race — leader/runner-up ratio ≈ 1.06.
+    df = pd.DataFrame({
+        "Race_Name": ["MAYOR"] * 4,
+        "Candidate": ["TUERK", "OCONNELL", "GURIDY", "GERLACH"],
+        "Percent": [26.63, 25.06, 24.86, 23.45],
+        "Votes": [2100.0, 2000.0, 1990.0, 1880.0],
+    })
+    out = filter_write_in_fragmentation(df)
+    assert len(out) == 4
 
 
 def test_oe_strips_periods_and_party_suffix_from_candidate():
@@ -1169,9 +1228,14 @@ def test_wprdc_aggregates_duplicate_candidate_rows_within_race():
 # --- _parse_clarity_summary_json -------------------------------------------
 
 def _clarity_contest(cat, c, ch, v, p=None, vf=1):
+    # Default per-candidate party derived from CAT so test contests look like
+    # real filed candidates, not empty-P write-ins. Tests that specifically
+    # want the write-in case pass p explicitly.
+    if p is None:
+        default_p = {'Democratic': 'DEM', 'Republican': 'REP'}.get(cat, '')
+        p = [default_p] * len(ch)
     return {
-        'CAT': cat, 'C': c, 'CH': ch, 'V': v, 'VF': vf,
-        'P': p if p is not None else [''] * len(ch),
+        'CAT': cat, 'C': c, 'CH': ch, 'V': v, 'VF': vf, 'P': p,
     }
 
 
@@ -1229,6 +1293,32 @@ def test_clarity_empty_input_returns_empty_frame():
     out = _parse_clarity_summary_json([], is_primary=False)
     assert len(out) == 0
     assert list(out.columns) == ['Candidate', 'Race_Name', 'Votes']
+
+
+def test_clarity_drops_primary_contest_with_no_filed_candidates():
+    # Real York 2025 case: DEM District Attorney had no filed Democrats —
+    # only write-ins for the Republican incumbent (Barker) and challenger
+    # (Graybill), so every P entry is empty.
+    data = [
+        _clarity_contest('Democratic', 'District Attorney-DEM',
+            ch=['Write-In (Total)', 'TIM BARKER', 'JACK GRAYBILL  II',
+                'JACK GRAYBILL', 'TIMOTHY BARKER'],
+            v=[1187, 350, 86, 113, 14],
+            p=['', '', '', '', '']),  # all write-ins, no filed Dem
+        # Control: a real contested DEM primary on the same ballot should pass.
+        _clarity_contest('Democratic', 'Mayor of Sunbury',
+            ch=['Alice', 'Bob'], v=[800, 600], p=['DEM', 'DEM']),
+    ]
+    out = _parse_clarity_summary_json(data, is_primary=True)
+    assert set(out['Race_Name']) == {'DEM Mayor of Sunbury'}
+
+
+def test_clarity_general_contests_with_empty_P_are_kept():
+    # General contests don't get the no-filed-candidate filter — keep them.
+    data = [_clarity_contest('Pennsylvania', 'Mayor of Media',
+        ['Alice', 'Bob'], [100, 50], p=['', ''])]
+    out = _parse_clarity_summary_json(data, is_primary=False)
+    assert len(out) == 2
 
 
 # --- _rows_to_tidy -----------------------------------------------------

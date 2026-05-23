@@ -242,6 +242,33 @@ def _normalize_candidate(s: pd.Series) -> pd.Series:
     return out
 
 
+def _is_nickname_variant(name: str, canonical: str) -> bool:
+    """True if `name` looks like a nickname / short-form variant of
+    `canonical` (or vice versa). The pairs we want to merge:
+
+      * "GREG BOWER"      ↔ "GREGORY BOWER"    (first-name prefix)
+      * "CLIFF ACKMAN"    ↔ "CLIFFORD ACKMAN"  (first-name prefix)
+      * "KEUERLEBER"      ↔ "RICHARD KEUERLEBER"  (single-token last name)
+
+    Requires the last token (last name) to match exactly; first-name match
+    is either prefix (≥3 chars) or implied by the shorter name being a
+    single token equal to the longer name's last token. SequenceMatcher
+    misses all three of these (ratios 0.71–0.89), so they slip through the
+    generic fuzzy threshold.
+    """
+    n = name.split()
+    c = canonical.split()
+    if not n or not c or n[-1] != c[-1]:
+        return False
+    # Single-token (last-name only) vs multi-token: definitely the same person.
+    if len(n) == 1 or len(c) == 1:
+        return True
+    # Both multi-token: require first-name prefix relationship (≥3 chars to
+    # avoid collapsing JO/JOHN/JOANNE-type unrelated short names).
+    shorter, longer = sorted([n[0], c[0]], key=len)
+    return len(shorter) >= 3 and longer.startswith(shorter) and shorter != longer
+
+
 def fuzzy_canonicalize_candidates(
     df: pd.DataFrame,
     *,
@@ -249,14 +276,17 @@ def fuzzy_canonicalize_candidates(
     min_length: int = 6,
 ) -> pd.DataFrame:
     """Merge near-duplicate candidate names *within each race* (likely typos
-    like `DOUGHHERTY` vs `DOUGHERTY`). Within a race, names are processed in
-    vote-count order; the highest-vote spelling becomes canonical, and any
-    later spelling within `ratio_threshold` is remapped to it.
+    like `DOUGHHERTY` vs `DOUGHERTY`, or nickname variants like `GREG BOWER`
+    vs `GREGORY BOWER`). Within a race, names are processed in vote-count
+    order; the highest-vote spelling becomes canonical, and any later
+    spelling that either (a) is within `ratio_threshold` by SequenceMatcher
+    or (b) is a nickname/short-form variant per `_is_nickname_variant`
+    gets remapped to it.
 
     `min_length` (default 6) prevents short distinct names like `JOHN`/`JOAN`
-    from being collapsed. The 0.92 threshold leaves gov/president ticket
-    variants like `TRUMP` vs `TRUMP / VANCE` (~0.55) alone — fuzzy matching
-    is the wrong tool for that problem.
+    from being collapsed via the SequenceMatcher path. The 0.92 threshold
+    leaves gov/president ticket variants like `TRUMP` vs `TRUMP / VANCE`
+    (~0.55) alone — fuzzy matching is the wrong tool for that problem.
     """
     if df.empty:
         return df
@@ -269,14 +299,16 @@ def fuzzy_canonicalize_candidates(
         for name in group['Candidate']:
             if name in mapping:
                 continue
-            if len(name) < min_length:
-                mapping[name] = name
-                continue
             matched = next(
-                (c for c in canonicals
-                 if SequenceMatcher(None, name, c).ratio() >= ratio_threshold),
+                (c for c in canonicals if _is_nickname_variant(name, c)),
                 None,
             )
+            if matched is None and len(name) >= min_length:
+                matched = next(
+                    (c for c in canonicals
+                     if SequenceMatcher(None, name, c).ratio() >= ratio_threshold),
+                    None,
+                )
             if matched is None:
                 canonicals.append(name)
                 mapping[name] = name
@@ -765,6 +797,14 @@ def _parse_clarity_summary_json(data: list[dict], *, is_primary: bool) -> pd.Dat
     For primaries we prepend the short party code derived from CAT to the
     contest name when not already prefixed — same conditional-prepend logic
     as the WPRDC parser. The trailing "(DEM)" duplicate is also stripped.
+
+    For primary contests where no candidate has a `P` value matching the
+    contest's `CAT` party (i.e., nobody filed for that party's nomination),
+    the entire contest is dropped: any "candidates" present are write-ins
+    breaking down individual write-in spellings, often the *other* party's
+    unopposed incumbent. Auditing the York County 2025 DEM primary
+    surfaced this in District Attorney, County Controller, County Coroner,
+    Recorder of Deeds, Clerk of Courts, and Sheriff races.
     """
     rows = []
     for contest in data:
@@ -776,6 +816,13 @@ def _parse_clarity_summary_json(data: list[dict], *, is_primary: bool) -> pd.Dat
             continue
         cat = str(contest.get('CAT') or '').strip().upper()
         party_prefix = _CLARITY_CAT_TO_PARTY.get(cat, '')
+        parties = contest.get('P') or []
+        # Drop primary contests with no filed-for-this-party candidates.
+        # All votes are then write-ins (often for the opposite-party
+        # incumbent), and the "race" doesn't exist in any real sense.
+        if is_primary and party_prefix:
+            if not any(str(p).strip().upper() == party_prefix for p in parties):
+                continue
         if is_primary and party_prefix:
             first_word = contest_name.split(' ', 1)[0].upper()
             if first_word not in _PARTY_CODES:
@@ -1275,6 +1322,39 @@ def filter_exclude_race_names(df: pd.DataFrame, pattern: Optional[str]) -> pd.Da
     return df[~mask].copy()
 
 
+def filter_write_in_fragmentation(
+    df: pd.DataFrame, *, max_ratio: float = 3.0,
+) -> pd.DataFrame:
+    """Drop races where the leader has more than `max_ratio` times the
+    runner-up's vote share. Real competitive non-majority primaries have
+    leader/runner-up < 2 (Tuerk 26.6 / O'Connell 25.1 = 1.06; Parker
+    32.7 / Rhynhart 22.8 = 1.43); ratios above 3 reliably signal an
+    uncontested party primary where voters wrote in various spellings
+    of the unopposed other-party incumbent's name.
+
+    Audited examples that this filter drops (all York County 2023/2025
+    DEM primaries for offices where the Republican incumbent ran
+    unopposed in the general):
+
+      * DEM Recorder of Deeds 2025 — Shue 39.96 / Riston 1.45 (ratio 27.6)
+      * DEM Clerk of Courts 2023 — Byrnes 32.75 / Supler 3.77 (ratio 8.7)
+      * DEM Sheriff 2023 — Keuerleber 29.84 / Becker 4.03 (ratio 7.4)
+      * DEM County Coroner 2025 — Zech 43.37 / Gay 7.40 (ratio 5.9)
+      * DEM District Attorney 2025 — Barker 35.92 / Graybill 11.29 (ratio 3.2)
+      * DEM County Controller 2025 — Bower 21.56 / Ackman 9.32 (ratio 3.2,
+        post-canonicalization of GREG/GREGORY BOWER + CLIFF/CLIFFORD ACKMAN)
+    """
+    if df.empty or 'Race_Name' not in df.columns or 'Percent' not in df.columns:
+        return df
+    bad: set[str] = set()
+    for race, g in df.groupby('Race_Name', sort=False):
+        sorted_pct = sorted(g['Percent'].dropna(), reverse=True)
+        if len(sorted_pct) >= 2 and sorted_pct[1] > 0:
+            if sorted_pct[0] / sorted_pct[1] > max_ratio:
+                bad.add(race)
+    return df[~df['Race_Name'].isin(bad)].copy()
+
+
 def filter_likely_multiseat_races(df: pd.DataFrame) -> pd.DataFrame:
     """Drop races whose names look like Vote For N>1 contests.
 
@@ -1333,6 +1413,7 @@ def write_workbook(
             tidy = filter_race_names(tidy, race_pattern)
             tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
             tidy = filter_likely_multiseat_races(tidy)
+            tidy = filter_write_in_fragmentation(tidy)
             sheet = format_for_sheet(tidy)
             sheet.to_excel(writer, sheet_name=source.name, index=False)
 
@@ -1411,6 +1492,7 @@ def write_workbook_pooled_by_category(
         tidy = filter_race_names(tidy, race_pattern)
         tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
         tidy = filter_likely_multiseat_races(tidy)
+        tidy = filter_write_in_fragmentation(tidy)
         race_count = tidy['Race_Name'].nunique() if not tidy.empty else 0
         print(f"  -> {race_count} non-majority races")
         by_cat.setdefault(source.category, []).append((source, tidy))

@@ -226,6 +226,20 @@ Also: added `"NOT"`, `"OVER"`, `"UNDER"` (bare tokens) to `_NON_CANDIDATE_NAMES`
 
 End result: `Top_RCV_Races.xlsx` went from 242 to 150 non-majority races. The remaining surface is dominated by genuine 50/50 ties (East Deer, Sunbury, Berks "winner by draw" races) and competitive primaries (Tuerk Allentown 2021 at 26.6%, Parker Philly 2023 at 32.6%).
 
+### 19. Write-in fragmentation in uncontested party primaries
+
+A second pass on the 150 races surfaced six remaining bogus races, all York County DEM primaries (2023 + 2025) where no Democrat filed. Voters wrote in the unopposed Republican incumbent's name, scattered across multiple spelling variants (`GREG BOWER` + `GREGORY BOWER`, `JACK GRAYBILL II` + `JACK GRAYBILL`, `RICHARD KEUERLEBER` + `KEUERLEBER`, etc.), producing the appearance of a competitive non-majority race with the "leader" at 20-40% and the "runner-up" at 1-8%.
+
+Three independent gaps, fixed in one pass:
+
+1. **Fuzzy canonicalization missed nickname / short-form variants.** SequenceMatcher returns 0.87 for `GREGORY BOWER` vs `GREG BOWER`, below the 0.92 threshold. Added `_is_nickname_variant` as a pre-check in `fuzzy_canonicalize_candidates`: it merges names with identical last token where either (a) one is a single-token last-name match against a multi-token full name (`KEUERLEBER` ↔ `RICHARD KEUERLEBER`), or (b) the shorter first name is a ≥3-char prefix of the longer first name (`GREG` ↔ `GREGORY`, `CLIFF` ↔ `CLIFFORD`). Common diminutives without a prefix relationship (`MIKE`/`MICHAEL`, `BOB`/`ROBERT`) still aren't merged — that would need a name-equivalence table.
+
+2. **No pipeline-level filter for the write-in-fragmentation signature.** Real competitive non-majority primaries have leader/runner-up ratio under 2 (Tuerk 26.6 / O'Connell 25.1 = 1.06; Parker 32.7 / Rhynhart 22.8 = 1.43). Uncontested primaries with scattered write-ins have ratios from 3 to 28. Added `filter_write_in_fragmentation(df, max_ratio=3.0)` applied as a final stage in both `write_workbook` and `write_workbook_pooled_by_category`. This catches 5 of the 6 York races on its own.
+
+3. **The 6th York race (`DEM District Attorney 2025`) had ratio only 2.19** — Barker 39.25 / Graybill 17.96 — but it's bogus too: both Barker and Graybill ran in the *Republican* primary, no Democrat filed. The clean signal lives in the Clarity `summary.json` itself: every entry in the `P` (parties) array for the DEM contest was empty, while a real contested primary has at least one entry matching the contest's `CAT` party. Added that check in `_parse_clarity_summary_json`: drop primary contests where no candidate's `P` matches the contest's party. This is the Clarity-source equivalent of the same-party-count heuristic we use for OE data.
+
+Final count: 242 → 142 non-majority races, all manually spot-checkable. The audit confirmed canonical races (Tuerk, Parker, Nutter 2007 Philly, East Deer tie, Sunbury tie, Berks winner-by-draw, Nina Ahmad's 2020 PA Auditor General primary, Napoleon Nelson's GA-154 primary) all still surface.
+
 ## Filtering thresholds and rationale
 
 | Filter | Default | Why |
