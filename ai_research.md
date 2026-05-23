@@ -207,6 +207,25 @@ After tightening the write-in filter, some races that previously looked non-majo
 
 **Note**: this changed a few Allegheny/2025-PA counts as a side effect. Comparing before/after, no real RCV-relevant race was lost — only races where the "non-majority" classification was an artifact of including write-in inflation in the denominator.
 
+### 18. OE county-rollup CSVs concatenate office+district into one buggy string
+
+A user-prompted cross-check of the 2025 PA Local workbook (which used OE's `__county.csv` rollup files) surfaced four classes of broken races, all traceable to the same upstream problem:
+
+  * **`TAX COLLECTOR WORTH TWP` (14 candidates)** and **`TAX COLLECTOR WORTH TOWNSHIP` (10 candidates)** — the county.csv files give the office name as `"Tax Collector WORTH TWP"`, with the district encoded into the office string instead of the separate `district` column. PA has multiple Worth Townships (Butler, Centre, Lawrence, Mercer); our pipeline correctly merged all candidates with the same office string and got a cross-county pseudo-race. Centre's actual Worth Twp Tax Collector race in 2025 had **one candidate** (Zerby, 250 votes).
+  * **`INSPECTOR OF ELECTIONS WORMLEYSBURG 2` (12 candidates)** — Cumberland's actual race had **one filed candidate** (Sharon Rudy). The other 11 "candidates" included 10 write-in surnames and a parsing artifact: OE's CSV literally contained a candidate named `OVER` with 64/76 votes, mis-extracted from an over-votes meta row.
+  * **`SUPERVISOR JUNIATA TWP` (Kane 49.29% / Garlick 49.29%, identical 242-vote totals)** — Blair's county.csv has the same string `"Supervisor JUNIATA TWP"` for *both* the Township Supervisor race (Kane) AND the Township Auditor race (Garlick). The OE PDF→CSV converter didn't detect the section boundary between Supervisor and Auditor — same class of bug as the Northumberland Marion Heights fix [[northumberland-mayor-fix]]. Replicated across five Blair townships (Juniata / Logan / Snyder / Freedom / Woodbury). Bare meta rows labeled `"Not"` with small vote counts also appeared in every Blair race.
+  * **`DEM County Controller-DEM York 2025` (7 candidates, 21.6% leader)** — Greg Bower is the Republican incumbent who ran unopposed; no Democrat filed. All 7 "candidates" are write-ins, including duplicate spellings (`GREGORY BOWER` + `GREG BOWER`, `CLIFFORD ACKMAN` + `CLIFF ACKMAN`) that our fuzzy canonicalizer missed because they shared no high-enough character ratio.
+
+**Two fixes**, both in one commit:
+
+1. **Switch the 2025 PA-Local stitch from `__county.csv` to `__precinct.csv`**. The precinct files keep `office` and `district` in separate columns (e.g. `office="Township Supervisor"`, `district="Juniata Township"` rather than `office="Supervisor JUNIATA TWP"`), and additionally include a `vote_for` column. When `vote_for` is present we use it authoritatively in `_parse_openelections_df` to drop multi-seat rows. The precinct files also lack the `"Not"` pseudo-candidate rows the county rollups insert.
+
+2. **Add a `scope_by_county` flag** to `_parse_openelections_df` and `StitchedOpenElectionsCountiesSource`. When set, every Race_Name is prefixed with the county name, so the four Worth Townships, two Springfield Townships, and other same-name-across-counties municipalities stay distinct. The flag is opt-in per source — set to `True` only for purely-local sources like `PA_LOCAL_2025_SOURCES`, and left `False` for state/federal sources where the merge across counties is correct.
+
+Also: added `"NOT"`, `"OVER"`, `"UNDER"` (bare tokens) to `_NON_CANDIDATE_NAMES`, and added a `_OFFICE_IS_BARE_SCHOOL_DISTRICT_RE` rule so race names that end in just `"<Place> School District"` (with no region/seat number after — e.g. Dauphin's `"Halifax Area School District"`) are filtered as at-large school-board multi-seat. Numbered region races (`"Susquenita School District III"`) are unaffected and continue to surface — and one of them, Susquenita's at-large Region III seat, was a 50/50 tie in 2025.
+
+End result: `Top_RCV_Races.xlsx` went from 242 to 150 non-majority races. The remaining surface is dominated by genuine 50/50 ties (East Deer, Sunbury, Berks "winner by draw" races) and competitive primaries (Tuerk Allentown 2021 at 26.6%, Parker Philly 2023 at 32.6%).
+
 ## Filtering thresholds and rationale
 
 | Filter | Default | Why |

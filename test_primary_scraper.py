@@ -372,6 +372,12 @@ def _oe_df(rows):
     return pd.DataFrame(rows, columns=cols).astype(str).replace('nan', '')
 
 
+def _oe_df_with(extra_cols, rows):
+    """Like _oe_df but allows extra columns (e.g. vote_for from precinct CSVs)."""
+    cols = ['county', 'office', 'district', 'party', 'candidate', 'votes'] + extra_cols
+    return pd.DataFrame(rows, columns=cols).astype(str).replace('nan', '')
+
+
 def test_oe_general_race_name_uses_office_only_when_no_district():
     df = _oe_df([
         {'county': 'Adams', 'office': 'President', 'district': '',
@@ -639,6 +645,18 @@ def test_likely_multiseat_flags_school_director():
     assert _is_likely_multiseat_race("WILLIAMSPORT SCH DIRECTORS")
 
 
+def test_likely_multiseat_flags_bare_school_district_office():
+    # Dauphin's 2025 OE precinct file uses the school-district name as the
+    # office (e.g. "Halifax Area School District") without saying "Director".
+    # Those races are Vote For 4 at-large school-board elections.
+    assert _is_likely_multiseat_race("DAUPHIN HALIFAX AREA SCHOOL DISTRICT")
+    assert _is_likely_multiseat_race("HARRISBURG SCHOOL DISTRICT")
+    assert _is_likely_multiseat_race("Susquehanna Township School District")
+    # Races with an explicit region/seat number after "School District" are
+    # Vote For 1 (single seat per region) — keep them.
+    assert not _is_likely_multiseat_race("Susquenita School District 3")
+
+
 def test_likely_multiseat_flags_delegate_and_study_commission():
     # "Delegates" plural (DEM/REP convention delegates are 3-5 per district).
     assert _is_likely_multiseat_race(
@@ -853,6 +871,72 @@ def test_oe_missing_party_column_does_not_crash():
     ]).astype(str)
     out = _parse_openelections_df(df, is_primary=False)
     assert out['Race_Name'].tolist() == ['PRESIDENT']
+
+
+def test_oe_scope_by_county_separates_same_name_townships():
+    # Worth Township exists in Butler, Centre, Lawrence, and Mercer counties.
+    # Without scope_by_county, every Worth Twp Tax Collector race merges into
+    # one bogus pseudo-race; with scoping they stay distinct. (Parties left
+    # blank so the same-party-count heuristic doesn't drop the merged case
+    # before we can observe it.)
+    df = _oe_df([
+        {'county': 'Butler', 'office': 'Tax Collector', 'district': 'Worth Twp',
+         'party': '', 'candidate': 'Alice', 'votes': '100'},
+        {'county': 'Centre', 'office': 'Tax Collector', 'district': 'Worth Twp',
+         'party': '', 'candidate': 'Kristine Zerby', 'votes': '250'},
+        {'county': 'Mercer', 'office': 'Tax Collector', 'district': 'Worth Twp',
+         'party': '', 'candidate': 'Bob', 'votes': '180'},
+    ])
+    out_merged = _parse_openelections_df(df, is_primary=False)
+    assert out_merged['Race_Name'].nunique() == 1  # all 3 conflated
+
+    out_scoped = _parse_openelections_df(df, is_primary=False, scope_by_county=True)
+    assert set(out_scoped['Race_Name']) == {
+        'BUTLER TAX COLLECTOR Worth Twp',
+        'CENTRE TAX COLLECTOR Worth Twp',
+        'MERCER TAX COLLECTOR Worth Twp',
+    }
+
+
+def test_oe_vote_for_column_drops_multi_seat_rows_authoritatively():
+    # OE precinct CSVs from 2025+ include a `vote_for` column. When present,
+    # rows with vote_for > 1 are dropped before the heuristic regex runs.
+    df = _oe_df_with(['vote_for'], [
+        {'county': 'Adams', 'office': 'Mayor', 'district': 'Boroughville',
+         'party': 'REP', 'candidate': 'Alice', 'votes': '100', 'vote_for': '1'},
+        {'county': 'Adams', 'office': 'Borough Council', 'district': 'Boroughville',
+         'party': 'REP', 'candidate': 'Bob', 'votes': '90', 'vote_for': '4'},
+        {'county': 'Adams', 'office': 'Borough Council', 'district': 'Boroughville',
+         'party': 'REP', 'candidate': 'Carol', 'votes': '80', 'vote_for': '4'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    assert 'BOB' not in out['Candidate'].tolist()
+    assert 'CAROL' not in out['Candidate'].tolist()
+    assert 'ALICE' in out['Candidate'].tolist()
+
+
+def test_oe_drops_bare_NOT_OVER_meta_candidates():
+    # Blair County's 2025 OE county.csv has a "Not" row in every race with
+    # small vote counts — likely "Not Voted" mis-extracted as a candidate.
+    # Cumberland's precinct CSV has "OVER" alone in Inspector-of-Elections.
+    df = _oe_df([
+        {'county': 'Blair', 'office': 'Supervisor', 'district': 'Juniata Twp',
+         'party': 'REP', 'candidate': 'David Kane', 'votes': '242'},
+        {'county': 'Blair', 'office': 'Supervisor', 'district': 'Juniata Twp',
+         'party': '', 'candidate': 'Not', 'votes': '5'},
+        {'county': 'Cumberland', 'office': 'Inspector of Elections',
+         'district': 'Newville North', 'party': '',
+         'candidate': 'OVER', 'votes': '64'},
+        {'county': 'Cumberland', 'office': 'Inspector of Elections',
+         'district': 'Newville North', 'party': 'DEM',
+         'candidate': 'Real Person', 'votes': '100'},
+    ])
+    out = _parse_openelections_df(df, is_primary=False)
+    cands = set(out['Candidate'])
+    assert 'NOT' not in cands
+    assert 'OVER' not in cands
+    assert 'DAVID KANE' in cands
+    assert 'REAL PERSON' in cands
 
 
 # --- format_pooled_for_sheet -----------------------------------------------

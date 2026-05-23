@@ -178,6 +178,13 @@ _NON_CANDIDATE_NAMES = frozenset({
     'CONTEST TOTALS',    # Mercer / Northumberland: total ballots cast in the contest
     'TIMES BLANK VOTED', 'TIMES OVER VOTED', 'TIMES UNDER VOTED',  # Electionware stat rows
     'TOTAL',  # Lycoming per-contest sum row
+    # Bare-token meta rows seen in OE 2025 county.csv rollups (Blair has
+    # "Not" with small vote counts in every race — likely "Not Voted" /
+    # "Not Cast" mis-extracted from the source PDF; Cumberland's precinct
+    # CSV has "OVER" alone in Inspector-of-Elections rows). Adding the
+    # singular tokens here is safe because real candidate names are
+    # multi-token.
+    'NOT', 'OVER', 'UNDER',
 })
 
 # Anything matching this is treated as a write-in aggregate/variant and
@@ -283,7 +290,12 @@ def fuzzy_canonicalize_candidates(
     return combined.groupby(['Race_Name', 'Candidate'], as_index=False)['Votes'].sum()
 
 
-def _parse_openelections_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFrame:
+def _parse_openelections_df(
+    df: pd.DataFrame,
+    *,
+    is_primary: bool,
+    scope_by_county: bool = False,
+) -> pd.DataFrame:
     """Aggregate an OpenElections-format (2018+) tidy CSV into [Candidate, Race_Name, Votes].
 
     Expected columns: county, office, district, party, candidate, votes (extras
@@ -293,16 +305,40 @@ def _parse_openelections_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFra
     so each party's contest becomes its own race. Candidate / office / party
     strings are upper-cased before grouping so case differences across counties
     don't split a single candidate's votes.
+
+    `scope_by_county=True` prepends the county name to every Race_Name. Use
+    this for purely-local source data (township / borough / city races)
+    where PA has many duplicate municipality names — e.g. Worth Township
+    exists in Butler, Centre, Lawrence, and Mercer counties, and without
+    scoping all four tax-collector races would be merged into one. Don't
+    enable this for state/federal races, which span multiple counties and
+    rely on the cross-county merge.
+
+    `vote_for` column (present in OE precinct CSVs from 2025+) is consulted
+    authoritatively when available: rows with vote_for > 1 are dropped as
+    multi-seat. This replaces our heuristic regex for sources that publish
+    the metadata.
     """
     df = df.copy()
     df['_candidate'] = _normalize_candidate(df['candidate'])
     df = df[df['_candidate'] != '']
     df = df[~_is_non_candidate(df['_candidate'])].reset_index(drop=True)
 
+    # Drop multi-seat rows authoritatively when the source publishes vote_for
+    # (OE precinct CSVs from 2025 onward). The heuristic regex below catches
+    # the rest for older / county-rollup sources that lack this column.
+    if 'vote_for' in df.columns:
+        vf = pd.to_numeric(df['vote_for'], errors='coerce')
+        df = df[(vf.isna()) | (vf <= 1)].reset_index(drop=True)
+
     office = _normalize_text(df['office'])
     district = df['district'].fillna('').astype(str).str.strip()
     party_col = df['party'] if 'party' in df.columns else pd.Series('', index=df.index)
     party = _normalize_text(party_col)
+    county_col = (
+        df['county'] if 'county' in df.columns else pd.Series('', index=df.index)
+    )
+    county = _normalize_text(county_col)
 
     # Drop rows for office types that always require a district but where the
     # district column is blank — leaving them in would silently merge candidates
@@ -312,11 +348,14 @@ def _parse_openelections_df(df: pd.DataFrame, *, is_primary: bool) -> pd.DataFra
     office = office[~bad].reset_index(drop=True)
     district = district[~bad].reset_index(drop=True)
     party = party[~bad].reset_index(drop=True)
+    county = county[~bad].reset_index(drop=True)
 
     if is_primary:
         race_name = party + ' ' + office + ' ' + district
     else:
         race_name = office + ' ' + district
+    if scope_by_county:
+        race_name = county + ' ' + race_name
     race_name = race_name.str.replace(r'\s+', ' ', regex=True).str.strip()
 
     # Drop races that look like multi-seat — OE source data doesn't preserve
@@ -464,6 +503,15 @@ _LIKELY_MULTISEAT_KEYWORDS_RE = re.compile(
 )
 _COUNCIL_RE = re.compile(r"\bcouncil\b", re.IGNORECASE)
 _SD_ABBREV_RE = re.compile(r"\bsd\b", re.IGNORECASE)
+# Race name that ends in "<Place> School District" with no further qualifier
+# is an at-large school-board election (e.g. Dauphin's 2025 "Halifax Area
+# School District" with 5 candidates competing for Vote For 4 seats). A
+# race that has a region/seat designator after — "<District> School
+# District III", "<District> School District Region 2" — is Vote For 1
+# by region and excluded by the _DISTRICT_NUMBERED_RE check above.
+_OFFICE_IS_BARE_SCHOOL_DISTRICT_RE = re.compile(
+    r"school\s+district\s*$", re.IGNORECASE,
+)
 # District-numbered race (e.g. "Council District 9") — Vote For 1.
 _DISTRICT_NUMBERED_RE = re.compile(r"\bdistrict\s+\d", re.IGNORECASE)
 
@@ -490,6 +538,8 @@ def _is_likely_multiseat_race(race_name: str) -> bool:
     if _COUNCIL_RE.search(race_name):
         return True
     if _SD_ABBREV_RE.search(race_name):
+        return True
+    if _OFFICE_IS_BARE_SCHOOL_DISTRICT_RE.search(race_name):
         return True
     return False
 
@@ -535,6 +585,10 @@ class StitchedOpenElectionsCountiesSource(ElectionSource):
     filename_exclude_substrs: tuple[str, ...] = ()
     is_primary: bool = False
     expected_counties: int = 67
+    # Prepend the county name to every Race_Name (see _parse_openelections_df).
+    # Enable for purely-local sources where PA's many duplicate township /
+    # borough names would otherwise be merged across counties.
+    scope_by_county: bool = False
 
     def fetch_tidy(self) -> pd.DataFrame:
         filenames = self._list_matching_files()
@@ -550,7 +604,11 @@ class StitchedOpenElectionsCountiesSource(ElectionSource):
         self.coverage_note = (
             f"{_coverage_from_counties(combined, self.expected_counties)} (stitched)"
         )
-        return _parse_openelections_df(combined, is_primary=self.is_primary)
+        return _parse_openelections_df(
+            combined,
+            is_primary=self.is_primary,
+            scope_by_county=self.scope_by_county,
+        )
 
     def _list_matching_files(self) -> list[str]:
         req = urllib.request.Request(
@@ -1499,7 +1557,20 @@ PA_LOCAL_2025_SOURCES: list[ElectionSource] = [
         listing_api_url=_OE_API + "2025/counties",
         raw_base_url=_OE_RAW + "2025/counties/",
         filename_substr="__general__",
-        filename_suffix="__county.csv",
+        # Use precinct files (not county.csv rollups): OE's 2025 county
+        # rollups concatenate office+district into one buggy `office`
+        # string ("Supervisor JUNIATA TWP"), which merges adjacent races
+        # whose section boundaries the PDF→CSV converter mis-detected
+        # (e.g., Township Supervisor + Township Auditor in Blair County).
+        # The precinct files keep office and district properly separated
+        # and additionally include a `vote_for` column we use to drop
+        # multi-seat races authoritatively.
+        filename_suffix="__precinct.csv",
+        # Prepend county name to every Race_Name. PA has many duplicate
+        # local-government names (Worth Twp in 4 counties, Springfield in
+        # 7+, Juniata Twp in 4+) and without scoping all of those races
+        # collapse into one bogus pseudo-race.
+        scope_by_county=True,
         # Skip counties whose OE-parsed data has known conflation bugs;
         # those counties are integrated separately via their source PDFs
         # (see ELECTIONWARE_PDF_SOURCES). Northumberland: OE's 2025 file
