@@ -1322,6 +1322,38 @@ def filter_exclude_race_names(df: pd.DataFrame, pattern: Optional[str]) -> pd.Da
     return df[~mask].copy()
 
 
+def filter_rcv_useful_races(
+    df: pd.DataFrame, *, min_candidates: int = 3,
+) -> pd.DataFrame:
+    """Narrow to races where RCV would have been genuinely useful.
+
+    Two conditions, both must hold:
+
+    1. At least `min_candidates` candidates survive the upstream
+       per-candidate threshold (`filter_min_candidate_percent`, default
+       1%). Two-candidate races — including 50/50 ties — get dropped
+       because RCV can't redistribute anything with only two choices.
+
+    2. The top two candidates aren't exactly tied. A 50/50 outcome is
+       a different problem (resolved by coin flip / marble draw under
+       PA election code); RCV doesn't help unless there's a third
+       candidate whose voters' second choices could break the tie,
+       which our data doesn't currently surface.
+    """
+    if df.empty or 'Race_Name' not in df.columns:
+        return df
+    bad: set[str] = set()
+    for race, g in df.groupby('Race_Name', sort=False):
+        if g['Candidate'].nunique() < min_candidates:
+            bad.add(race)
+            continue
+        if 'Percent' in g.columns:
+            top = sorted(g['Percent'].dropna(), reverse=True)
+            if len(top) >= 2 and top[0] == top[1]:
+                bad.add(race)
+    return df[~df['Race_Name'].isin(bad)].copy()
+
+
 def filter_write_in_fragmentation(
     df: pd.DataFrame, *, max_ratio: float = 3.0,
 ) -> pd.DataFrame:
@@ -1414,6 +1446,7 @@ def write_workbook(
             tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
             tidy = filter_likely_multiseat_races(tidy)
             tidy = filter_write_in_fragmentation(tidy)
+            tidy = filter_rcv_useful_races(tidy)
             sheet = format_for_sheet(tidy)
             sheet.to_excel(writer, sheet_name=source.name, index=False)
 
@@ -1493,6 +1526,7 @@ def write_workbook_pooled_by_category(
         tidy = filter_exclude_race_names(tidy, race_exclude_pattern)
         tidy = filter_likely_multiseat_races(tidy)
         tidy = filter_write_in_fragmentation(tidy)
+        tidy = filter_rcv_useful_races(tidy)
         race_count = tidy['Race_Name'].nunique() if not tidy.empty else 0
         print(f"  -> {race_count} non-majority races")
         by_cat.setdefault(source.category, []).append((source, tidy))

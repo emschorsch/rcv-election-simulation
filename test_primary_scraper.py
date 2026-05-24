@@ -21,6 +21,7 @@ from primary_scraper import (
     add_percentages,
     filter_exclude_race_names,
     filter_likely_multiseat_races,
+    filter_rcv_useful_races,
     filter_write_in_fragmentation,
     filter_min_candidate_percent,
     filter_min_leader_percent,
@@ -593,6 +594,43 @@ def test_filter_write_in_fragmentation_drops_extreme_leader_ratio():
     })
     out = filter_write_in_fragmentation(df)
     assert set(out['Race_Name']) == {"DEM Mayor Allentown"}
+
+
+def test_filter_rcv_useful_races_drops_two_candidate_races_including_ties():
+    df = pd.DataFrame({
+        "Race_Name": ["TWO CAND TIE", "TWO CAND TIE",
+                       "TWO CAND CLOSE", "TWO CAND CLOSE",
+                       "THREE WAY", "THREE WAY", "THREE WAY"],
+        "Candidate": ["A", "B", "C", "D", "E", "F", "G"],
+        "Percent": [50.0, 50.0, 49.0, 47.0, 35.0, 33.0, 32.0],
+        "Votes": [100.0, 100.0, 490.0, 470.0, 350.0, 330.0, 320.0],
+    })
+    out = filter_rcv_useful_races(df)
+    assert set(out['Race_Name']) == {"THREE WAY"}
+
+
+def test_filter_rcv_useful_races_drops_three_way_top_two_tie():
+    # If a 3-cand race has top-2 tied, RCV could break it via the 3rd
+    # candidate's transfers — but the user explicitly excludes ties.
+    df = pd.DataFrame({
+        "Race_Name": ["TIE 3WAY"] * 3 + ["CLOSE 3WAY"] * 3,
+        "Candidate": ["A", "B", "C", "D", "E", "F"],
+        "Percent": [49.0, 49.0, 2.0,   45.0, 35.0, 20.0],
+        "Votes": [490.0, 490.0, 20.0,  450.0, 350.0, 200.0],
+    })
+    out = filter_rcv_useful_races(df)
+    assert set(out['Race_Name']) == {"CLOSE 3WAY"}
+
+
+def test_filter_rcv_useful_races_respects_min_candidates_param():
+    df = pd.DataFrame({
+        "Race_Name": ["FOUR WAY"] * 4 + ["THREE WAY"] * 3,
+        "Candidate": ["A", "B", "C", "D", "E", "F", "G"],
+        "Percent": [30.0, 28.0, 25.0, 17.0, 40.0, 35.0, 25.0],
+        "Votes": [300.0, 280.0, 250.0, 170.0, 400.0, 350.0, 250.0],
+    })
+    out = filter_rcv_useful_races(df, min_candidates=4)
+    assert set(out['Race_Name']) == {"FOUR WAY"}
 
 
 def test_filter_write_in_fragmentation_keeps_real_close_races():

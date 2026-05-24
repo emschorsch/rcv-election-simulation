@@ -240,6 +240,15 @@ Three independent gaps, fixed in one pass:
 
 Final count: 242 → 142 non-majority races, all manually spot-checkable. The audit confirmed canonical races (Tuerk, Parker, Nutter 2007 Philly, East Deer tie, Sunbury tie, Berks winner-by-draw, Nina Ahmad's 2020 PA Auditor General primary, Napoleon Nelson's GA-154 primary) all still surface.
 
+### 20. Narrow to RCV-useful races (drop ties and two-candidate races)
+
+After the audit landed at 142 verified-clean races, the curation goal shifted from "all non-majority winners" to "races where RCV would have been genuinely useful." Two changes, applied universally in both writers as the final pipeline stage:
+
+1. Exclude exact ties at the top — `Top-2 Gap == 0`. PA election code resolves these by coin flip or marble draw (Berks 2025 had two confirmed cases); RCV doesn't help in a two-candidate tie because there's no third candidate's voters to redistribute.
+2. Require at least 3 distinct candidates above the 1% per-candidate threshold. Two-candidate non-majority races (which only occur when total ballots include write-ins or undervotes) aren't IRV cases — RCV can't change the winner with only two choices on the ballot.
+
+Implemented as `filter_rcv_useful_races(df, min_candidates=3)`. Drops 142 → 133 races. The 9 dropped were all 2-candidate (including all 7 exact 50/50 ties): East Deer Ward 2, Ross Ward 8, Berks Brecknock Twp / Rockland Twp (winner-by-draw), Susquenita School District III, Huntingdon Auditor Springfield, plus the Allegheny duplicate of East Deer and Sunbury Council. Closest 3-way race surviving: 2025 Lancaster Supervisor West Lampeter (Hershey 33.58 / Arnold 33.54 / 3rd ≈32.9, gap 0.04%).
+
 ## Filtering thresholds and rationale
 
 | Filter | Default | Why |
