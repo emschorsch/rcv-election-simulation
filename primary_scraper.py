@@ -778,11 +778,22 @@ _CLARITY_CAT_TO_PARTY = {
     'CONSTITUTION': 'CON',
 }
 
-# Trailing "(DEM)" / "(REP)" / etc. parenthetical on Clarity contest names —
-# duplicates the CAT field, so we strip it to get a clean contest name.
+# Trailing "(DEM)" / "(REP)" / etc. parenthetical on Clarity contest names.
+# In York's data this duplicates the CAT field (`CAT="Democratic"`); in
+# Luzerne's data it's the ONLY signal of party — Luzerne uses CAT="Results"
+# uniformly so we have to pull the party from the contest name. Erie uses
+# the full party word ("DEMOCRATIC") instead of the short code.
 _CLARITY_PARTY_PAREN_RE = re.compile(
-    r'\s*\((?:' + '|'.join(_PARTY_CODES) + r')\)\s*$', re.IGNORECASE
+    r'\s*\((DEMOCRATIC|REPUBLICAN|LIBERTARIAN|GREEN|INDEPENDENT|CONSTITUTION'
+    r'|' + '|'.join(_PARTY_CODES) + r')\)\s*$',
+    re.IGNORECASE,
 )
+# Long-form party word -> short code, for when a contest name uses the
+# verbose party-paren ("(DEMOCRATIC)" -> "DEM ").
+_CLARITY_PARTY_WORD_TO_CODE = {
+    'DEMOCRATIC': 'DEM', 'REPUBLICAN': 'REP', 'LIBERTARIAN': 'LIB',
+    'GREEN': 'GRN', 'INDEPENDENT': 'IND', 'CONSTITUTION': 'CON',
+}
 
 
 def _parse_clarity_summary_json(data: list[dict], *, is_primary: bool) -> pd.DataFrame:
@@ -811,11 +822,21 @@ def _parse_clarity_summary_json(data: list[dict], *, is_primary: bool) -> pd.Dat
         if int(contest.get('VF') or 1) > 1:
             continue  # multi-seat — skip
         contest_name = str(contest.get('C') or '').strip()
+        # Pull the party from a trailing "(DEM)"/"(REP)" paren BEFORE stripping
+        # — this is the only party signal for counties like Luzerne that use
+        # CAT="Results" uniformly. York's CAT="Democratic" still wins below
+        # if both are present.
+        paren_match = _CLARITY_PARTY_PAREN_RE.search(contest_name)
+        if paren_match:
+            raw = paren_match.group(1).upper()
+            name_party = _CLARITY_PARTY_WORD_TO_CODE.get(raw, raw)
+        else:
+            name_party = ''
         contest_name = _CLARITY_PARTY_PAREN_RE.sub('', contest_name).strip()
         if not contest_name:
             continue
         cat = str(contest.get('CAT') or '').strip().upper()
-        party_prefix = _CLARITY_CAT_TO_PARTY.get(cat, '')
+        party_prefix = _CLARITY_CAT_TO_PARTY.get(cat, '') or name_party
         parties = contest.get('P') or []
         # Drop primary contests with no filed-for-this-party candidates.
         # All votes are then write-ins (often for the opposite-party
@@ -1742,6 +1763,44 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
         name="2025 Delaware General", year=2025, category="Generals",
         coverage_note="Delaware County (Media + boroughs + townships)",
         url=_CLARITY_BASE + "Delaware/125145/",
+    ),
+    # Westmoreland County (suburban Pittsburgh) — full Clarity archive back
+    # to 2019. Contest names already include the "DEM "/"REP " prefix in the
+    # `C` field; the parser leaves them alone.
+    ClaritySummaryJsonSource(
+        name="2021 Westmoreland Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Westmoreland County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "Westmoreland/109366/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2023 Westmoreland Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Westmoreland County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "Westmoreland/117764/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2025 Westmoreland Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Westmoreland County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "Westmoreland/123823/",
+    ),
+    # Luzerne County (Wilkes-Barre / Hazleton). Contest names use a trailing
+    # "(DEM)" / "(REP)" parenthetical and CAT="Results" uniformly, so the
+    # parser pulls party from the paren before stripping it.
+    ClaritySummaryJsonSource(
+        name="2021 Luzerne Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Luzerne County (Wilkes-Barre + boroughs + townships)",
+        url=_CLARITY_BASE + "Luzerne/109364/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2025 Luzerne Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Luzerne County (Wilkes-Barre + boroughs + townships)",
+        url=_CLARITY_BASE + "Luzerne/123839/",
+    ),
+    # Erie County — Clarity covers 2024+. Pre-2024 results are on the
+    # county website as PDFs (deferred — see ai_research.md §22).
+    ClaritySummaryJsonSource(
+        name="2025 Erie Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Erie County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "Erie/123825/",
     ),
 ]
 

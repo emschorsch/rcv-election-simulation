@@ -1351,6 +1351,40 @@ def test_clarity_drops_primary_contest_with_no_filed_candidates():
     assert set(out['Race_Name']) == {'DEM Mayor of Sunbury'}
 
 
+def test_clarity_extracts_party_from_trailing_paren_when_cat_is_generic():
+    # Luzerne-style: CAT="Results" (uniform) but contest name has trailing
+    # "(DEM)"/"(REP)". Parser must extract the party from the paren so the
+    # "no filed Democrats" filter still works and the race_name gets the
+    # right prefix.
+    data = [
+        # Real contested DEM: TOM MOSCA is a filed DEM candidate.
+        {'CAT': 'Results', 'C': 'Judge of the Court of Common Pleas (DEM)',
+         'CH': ['TOM MOSCA', 'MARK BUFALINO', 'Write-in'],
+         'V': [13249, 6985, 50], 'P': ['DEM', 'DEM', ''], 'VF': 1},
+        # Uncontested DEM: all candidates are write-ins (P empty).
+        {'CAT': 'Results', 'C': 'District Attorney (DEM)',
+         'CH': ['Write-in', 'SOME WRITEIN'],
+         'V': [100, 50], 'P': ['', ''], 'VF': 1},
+    ]
+    out = _parse_clarity_summary_json(data, is_primary=True)
+    # Contested race kept, race_name prefixed with party from the paren.
+    assert 'DEM Judge of the Court of Common Pleas' in set(out['Race_Name'])
+    # Uncontested race dropped by the no-filed-candidate filter.
+    assert 'DEM District Attorney' not in set(out['Race_Name'])
+
+
+def test_clarity_extracts_party_from_full_word_paren_DEMOCRATIC():
+    # Erie's pattern: "(DEMOCRATIC)" instead of "(DEM)". Parser maps the
+    # long form to the short code so the race_name gets a "DEM " prefix.
+    data = [
+        {'CAT': 'County', 'C': 'COUNTY EXECUTIVE 4 YEAR TERM (DEMOCRATIC)',
+         'CH': ['Alice', 'Bob', 'Write-in'],
+         'V': [100, 80, 5], 'P': ['DEM', 'DEM', ''], 'VF': 1},
+    ]
+    out = _parse_clarity_summary_json(data, is_primary=True)
+    assert set(out['Race_Name']) == {'DEM COUNTY EXECUTIVE 4 YEAR TERM'}
+
+
 def test_clarity_general_contests_with_empty_P_are_kept():
     # General contests don't get the no-filed-candidate filter — keep them.
     data = [_clarity_contest('Pennsylvania', 'Mayor of Media',
