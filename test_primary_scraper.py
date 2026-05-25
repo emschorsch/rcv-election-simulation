@@ -1373,6 +1373,40 @@ def test_clarity_extracts_party_from_trailing_paren_when_cat_is_generic():
     assert 'DEM District Attorney' not in set(out['Race_Name'])
 
 
+def test_bucks_parser_total_first_with_party_in_header():
+    # Bucks's "ElectionSource"-vendor layout: party encoded in contest header
+    # only; candidate rows are "Name Total ED MI PR" with single-space sep.
+    from primary_scraper import _parse_bucks_pdf_lines
+    lines = [
+        "JUDGE OF THE SUPERIOR COURT - D (Dem) (Vote for 1)",
+        "BRANDON NEUMAN 53332 23608 29601 123",
+        "Write-in 313 189 123 1",
+        "Total 53645 23797 29724 124",
+        "JUDGE OF THE SUPERIOR COURT - R (Rep) (Vote for 1)",
+        "MARIA BATTISTA 16070 12104 3919 47",
+        "ANN MARIE WHEATCRAFT 23787 15429 8298 60",
+        # Ballot question shouldn't leak Yes/No into the previous contest.
+        "LANGHORNE MANOR BOROUGH REFERENDUM (Vote for 1)",
+        "Yes 74 64 10 0",
+        "No 102 74 27 1",
+        # Multi-seat contests are skipped entirely.
+        "DEM SCHOOL DIRECTOR (Vote for 4) - D (Dem) (Vote for 4)",
+        "DOES NOT MATTER 1000 1000 0 0",
+    ]
+    rows = _parse_bucks_pdf_lines(lines)
+    contests = {r['contest_name'] for r in rows}
+    by_name = {(r['contest_name'], r['candidate']): r['votes'] for r in rows}
+    # Both partisan contests captured.
+    assert 'DEM JUDGE OF THE SUPERIOR COURT' in contests
+    assert 'REP JUDGE OF THE SUPERIOR COURT' in contests
+    # Totals taken from the first number after the name.
+    assert by_name[('DEM JUDGE OF THE SUPERIOR COURT', 'BRANDON NEUMAN')] == 53332
+    assert by_name[('REP JUDGE OF THE SUPERIOR COURT', 'ANN MARIE WHEATCRAFT')] == 23787
+    # Yes/No didn't leak into either partisan contest.
+    yn_leak = [r for r in rows if r['candidate'].lower() in ('yes', 'no')]
+    assert yn_leak == []
+
+
 def test_electionware_handles_total_column_last_layout():
     # Montgomery County: candidate rows have a party code between name and
     # numbers, AND the Total column is LAST. The parser must take the last

@@ -1337,6 +1337,88 @@ class LycomingPdfSource(ElectionSource):
         return _rows_to_tidy(rows, is_primary=self.is_primary)
 
 
+# Bucks County uses an "ElectionSource"-vendor certified results PDF whose
+# layout is distinct from both Electionware and Lycoming:
+#
+#   Contest header:  "<Office Name> - D (Dem) (Vote for N)"   (party letter + paren)
+#   Candidate row:   "<NAME>  <Total>  <ED>  <MI>  <PR>"      (Total FIRST, single-
+#                                                              space separator)
+#   Closing row:     "Total  <T>  <ED>  <MI>  <PR>"           (dropped by NCN filter)
+#
+# Multi-word names like "BRANDON NEUMAN" or "KAREN M.S. KRIEGER" mean the
+# name-and-numbers boundary needs the trailing four numbers as the anchor.
+# Non-greedy `.+?` then captures whatever's before them as the name.
+
+_BUCKS_CONTEST_RE = re.compile(
+    r'^(.+?)\s+-\s+([DR])\s+\((?:Dem|Rep)\)\s+\(Vote for\s+(\d+)\)\s*$',
+    re.IGNORECASE,
+)
+# Any contest header (partisan or ballot-question / non-partisan), used to
+# reset current_contest so YES/NO votes from a referendum don't leak into
+# the preceding partisan race.
+_BUCKS_ANY_CONTEST_RE = re.compile(r'\(Vote for\s+\d+\)\s*$', re.IGNORECASE)
+_BUCKS_CAND_RE = re.compile(
+    r'^(.+?)\s+(\d[\d,]*)\s+(\d[\d,]*)\s+(\d[\d,]*)\s+(\d[\d,]*)\s*$'
+)
+
+
+def _parse_bucks_pdf_lines(lines: list[str]) -> list[dict]:
+    """Parse Bucks PDF text lines into raw result rows. Pure function.
+
+    Skips multi-seat (Vote for N>1) contests entirely. Contest names are
+    emitted with a "DEM "/"REP " prefix so they match the convention used
+    by `_rows_to_tidy` and the multi-seat-race filter downstream. Ballot
+    questions / non-partisan contests are recognized by their "(Vote for
+    N)" header (without the partisan " - D (Dem) " suffix) and used only
+    to reset current_contest — their YES/NO rows are discarded.
+    """
+    rows: list[dict] = []
+    current_contest: Optional[str] = None
+    for line in lines:
+        stripped = line.strip()
+        m = _BUCKS_CONTEST_RE.match(stripped)
+        if m:
+            office, party_letter, vf_str = m.groups()
+            vote_for_n = int(vf_str)
+            if vote_for_n > 1:
+                current_contest = None
+                continue
+            prefix = 'DEM' if party_letter.upper() == 'D' else 'REP'
+            current_contest = f"{prefix} {office.strip()}"
+            continue
+        # Non-partisan / ballot-question contest header — reset so the
+        # following YES/NO rows aren't credited to the prior partisan race.
+        if _BUCKS_ANY_CONTEST_RE.search(stripped):
+            current_contest = None
+            continue
+        if current_contest is None:
+            continue
+        cm = _BUCKS_CAND_RE.match(stripped)
+        if cm:
+            name = cm.group(1).strip()
+            total = int(cm.group(2).replace(',', ''))
+            rows.append({
+                'contest_name': current_contest,
+                'candidate': name,
+                'votes': total,
+            })
+    return rows
+
+
+@dataclass(kw_only=True)
+class BucksPdfSource(ElectionSource):
+    """Extract election results from Bucks County's "ElectionSource"-vendor
+    PDF. Different layout from Electionware / Lycoming: Total column FIRST,
+    single-space separator between name and numbers, party encoded in the
+    contest header rather than per-candidate."""
+    is_primary: bool = False
+
+    def fetch_tidy(self) -> pd.DataFrame:
+        print("  extracting Bucks PDF via pdfplumber...")
+        rows = _parse_bucks_pdf_lines(_pdf_url_to_lines(self.url))
+        return _rows_to_tidy(rows, is_primary=self.is_primary)
+
+
 # --- Pipeline ---------------------------------------------------------------
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -1867,6 +1949,19 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
         coverage_note="Erie County (city + boroughs + townships)",
         url=_CLARITY_BASE + "Erie/123825/",
     ),
+    # Cambria County (Johnstown + suburbs). Contest names already include the
+    # "DEM "/"REP " prefix (Westmoreland-style), so the parser handles them
+    # without further changes. Pre-2022 results aren't on Clarity.
+    ClaritySummaryJsonSource(
+        name="2023 Cambria Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Cambria County (Johnstown + boroughs + townships)",
+        url=_CLARITY_BASE + "Cambria/117757/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2025 Cambria Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Cambria County (Johnstown + boroughs + townships)",
+        url=_CLARITY_BASE + "Cambria/123841/",
+    ),
 ]
 
 
@@ -2087,6 +2182,27 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         url="https://www.eriecountycouncilpa.gov/uploads/modules/resources/"
             "688208_erie_county_2023_municipal_primary_official_results.pdf",
     ),
+    # Washington County (suburban Pittsburgh) — Berks-style Electionware
+    # layout (Name-Total-First, separate "Vote For N" line, party prefix
+    # on contest name). Pre-2025 archive on cms.washingtoncopa.gov.
+    ElectionwarePdfSource(
+        name="2021 Washington Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Washington County (Washington + boroughs + townships)",
+        url="https://cms.washingtoncopa.gov/uploads/"
+            "2021_Primary_Official_Results_Election_Summary_3868b5c430.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Washington Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Washington County (Washington + boroughs + townships)",
+        url="https://cms.washingtoncopa.gov/uploads/"
+            "2023_Primary_Official_Results_Election_Summary_a63e8ce175.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Washington Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Washington County (Washington + boroughs + townships)",
+        url="https://cms.washingtoncopa.gov/uploads/"
+            "2025_Municipal_Primary_Election_Summary_Official_4424b742e7.pdf",
+    ),
 ]
 
 
@@ -2097,9 +2213,30 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
 # first run.
 # LLM extraction is unavailable in this environment (no ANTHROPIC_API_KEY).
 # LlmPdfSource still exists for future use but its registry stays empty.
-# Bucks (different "ElectionSource" vendor format) is deferred until we write
-# a dedicated offline parser for that vendor.
 LLM_PDF_SOURCES: list[ElectionSource] = []
+
+
+# Bucks County (Doylestown + Philly suburbs) uses an "ElectionSource"-vendor
+# certified results PDF that BucksPdfSource handles directly (no LLM needed).
+_BUCKS_PDF_BASE = "https://www.buckscounty.gov/ArchiveCenter/ViewFile/Item/"
+
+BUCKS_PDF_SOURCES: list[ElectionSource] = [
+    BucksPdfSource(
+        name="2021 Bucks Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Bucks County (Doylestown + Philly suburbs)",
+        url=_BUCKS_PDF_BASE + "437",
+    ),
+    BucksPdfSource(
+        name="2023 Bucks Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Bucks County (Doylestown + Philly suburbs)",
+        url=_BUCKS_PDF_BASE + "518",
+    ),
+    BucksPdfSource(
+        name="2025 Bucks Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Bucks County (Doylestown + Philly suburbs)",
+        url=_BUCKS_PDF_BASE + "552",
+    ),
+]
 
 
 # Lycoming County (Williamsport + boroughs + townships) uses a different PDF
@@ -2348,7 +2485,7 @@ if __name__ == "__main__":
     mid_out = "Pennsylvania_NonMajority_MidCounties.xlsx"
     write_workbook_pooled_by_category(
         CLARITY_PA_SOURCES + ELECTIONWARE_PDF_SOURCES + LYCOMING_PDF_SOURCES
-            + LLM_PDF_SOURCES,
+            + BUCKS_PDF_SOURCES + LLM_PDF_SOURCES,
         mid_out,
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
