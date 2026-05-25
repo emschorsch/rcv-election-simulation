@@ -1373,6 +1373,52 @@ def test_clarity_extracts_party_from_trailing_paren_when_cat_is_generic():
     assert 'DEM District Attorney' not in set(out['Race_Name'])
 
 
+def test_electionware_handles_total_column_last_layout():
+    # Montgomery County: candidate rows have a party code between name and
+    # numbers, AND the Total column is LAST. The parser must take the last
+    # number as Total, not the first (which would be Election Day).
+    from primary_scraper import _parse_electionware_lines
+    lines = [
+        "Justice of the Supreme Court-DEM (Vote for 1)",
+        "DEM",
+        "Election Day Mail-in Provisional Total",
+        "Candidate Party Election Day Mail-in Provisional Total",
+        "Daniel McCaffery DEM 37,520 34,002 205 71,727",
+        "Debbie Kunselman DEM 10,407 7,555 40 18,002",
+    ]
+    rows = _parse_electionware_lines(lines)
+    by_name = {r['candidate']: r['votes'] for r in rows}
+    assert by_name == {'Daniel McCaffery': 71727, 'Debbie Kunselman': 18002}
+
+
+def test_electionware_handles_inline_vote_for_header():
+    # Montgomery-style: contest header line contains "(Vote for N)" inline
+    # instead of having a separate "Vote For N" line below the name.
+    from primary_scraper import _parse_electionware_lines
+    lines = [
+        "Justice of the Supreme Court-DEM (Vote for 1)",
+        "DEM",
+        "Election Day Mail-in Provisional Total",
+        "Times Cast 50,077 42,320 254 92,651 / 301,543 30.73%",
+        "Candidate Party Election Day Mail-in Provisional Total",
+        # Total-first layout (the parser only reads the first number after
+        # the name as TOTAL — so this test verifies the inline-VF detection
+        # works for counties that ALSO use the Berks-style column order).
+        "  Daniel McCaffery  71,727",
+        "  Debbie Kunselman  18,002",
+        # Next inline header should also end the inner loop cleanly.
+        "Some Other Contest (Vote for 2)",
+        "  Multi-Seat Candidate  10,000",
+    ]
+    rows = _parse_electionware_lines(lines)
+    contests = {r['contest_name'] for r in rows}
+    cands = {r['candidate'] for r in rows}
+    assert 'Justice of the Supreme Court-DEM' in contests
+    # Vote-for-2 contest gets dropped, so its candidate doesn't appear.
+    assert 'Multi-Seat Candidate' not in cands
+    assert {'Daniel McCaffery', 'Debbie Kunselman'} <= cands
+
+
 def test_clarity_extracts_party_from_full_word_paren_DEMOCRATIC():
     # Erie's pattern: "(DEMOCRATIC)" instead of "(DEM)". Parser maps the
     # long form to the short code so the race_name gets a "DEM " prefix.

@@ -175,6 +175,7 @@ _NON_CANDIDATE_NAMES = frozenset({
     'OVER VOTES', 'UNDER VOTES', 'OVERVOTES', 'UNDERVOTES',
     'NOT ASSIGNED', 'SCATTERED',
     'TOTAL VOTES CAST',  # Chester Electionware footer per contest
+    'TOTAL VOTES',  # Montgomery per-contest total row (different label, same role)
     'CONTEST TOTALS',    # Mercer / Northumberland: total ballots cast in the contest
     'TIMES BLANK VOTED', 'TIMES OVER VOTED', 'TIMES UNDER VOTED',  # Electionware stat rows
     'TOTAL',  # Lycoming per-contest sum row
@@ -1039,6 +1040,13 @@ class LlmPdfSource(ElectionSource):
     model: str = "claude-sonnet-4-6"
 
     def fetch_tidy(self) -> pd.DataFrame:
+        # Skip gracefully without an API key — the extraction is the only step
+        # that hits Anthropic. Cached results in .cache/llm/ still work fine
+        # offline, so we only skip when both the cache miss AND the key absent.
+        cache_path = _llm_cache_path(self.url)
+        if not cache_path.exists() and not os.environ.get('ANTHROPIC_API_KEY'):
+            print(f"  skipping {self.name}: ANTHROPIC_API_KEY not set and no cache hit")
+            return pd.DataFrame(columns=['Candidate', 'Race_Name', 'Votes'])
         print(f"  extracting via Claude ({self.model})...")
         rows = _extract_pdf_via_claude(self.url, model=self.model)
         return _rows_to_tidy(rows, is_primary=self.is_primary)
@@ -1061,6 +1069,12 @@ class LlmPdfSource(ElectionSource):
 # machine to walk the page text, anchoring on each "Vote For N" line.
 
 _ELECTIONWARE_VOTE_FOR_RE = re.compile(r'^\s*Vote For\s+(\d+)\s*$')
+# Some Electionware reports (Montgomery County) inline the vote-for-N marker
+# inside the contest header line as "(Vote for N)". Capture both the N and
+# the contest name itself.
+_ELECTIONWARE_INLINE_VF_RE = re.compile(
+    r'^(.*?)\s*\(Vote for\s+(\d+)\)\s*$', re.IGNORECASE,
+)
 # Header tokens (case-insensitive). Covers every variant we've seen across PA
 # Electionware-published PDFs: Berks uses {Election, TOTAL, Day, Mail,
 # Provisional}; Chester uses Election/TOTAL/Day/Absentee/Mail-In/Provisional;
@@ -1091,6 +1105,16 @@ _ELECTIONWARE_HEADER_TOKENS = frozenset({
 _ELECTIONWARE_CAND_RE = re.compile(
     r'^\s+([A-Za-z][^\d%]*?)\s{2,}([\d,]+)(?:\s+[\d,%.]+){0,5}\s*$'
 )
+# Montgomery County variant: candidate rows have the party code (DEM/REP/etc.)
+# inline between name and numbers, AND the Total column is LAST instead of
+# FIRST. Example: "Daniel McCaffery DEM 37,520 34,002 205 71,727" — 4 numbers,
+# last is total. We require at least 2 numbers so we don't false-match a
+# header line like "Candidate Party Election Day...".
+_PARTY_CODE_GROUP = '|'.join(_PARTY_CODES)
+_ELECTIONWARE_CAND_PARTY_RE = re.compile(
+    r'^\s*([A-Za-z][^\d%]*?)\s+(?:' + _PARTY_CODE_GROUP + r')'
+    r'(?:\s+[\d,]+){1,}\s+([\d,]+)\s*$'
+)
 
 
 def _parse_electionware_lines(lines: list[str]) -> list[dict]:
@@ -1104,43 +1128,63 @@ def _parse_electionware_lines(lines: list[str]) -> list[dict]:
     rows: list[dict] = []
     i = 0
     while i < len(lines):
-        m = _ELECTIONWARE_VOTE_FOR_RE.match(lines[i])
-        if not m:
+        # Two header layouts we've seen across PA Electionware reports:
+        # (a) standalone "Vote For N" line below a contest name line (Berks,
+        #     Chester, Lehigh, etc.)
+        # (b) inline "(Vote for N)" on the contest name line itself
+        #     (Montgomery)
+        m_standalone = _ELECTIONWARE_VOTE_FOR_RE.match(lines[i])
+        m_inline = _ELECTIONWARE_INLINE_VF_RE.match(lines[i])
+        if m_standalone:
+            vote_for_n = int(m_standalone.group(1))
+            # Walk backward (over blank lines and column-header lines) to
+            # find the contest header — the most recent non-blank,
+            # non-header line. "Column header" = a line whose tokens are
+            # all in the known set (Election / TOTAL / Day / Mail /
+            # Provisional, in any whitespace arrangement).
+            contest_name = None
+            for j in range(i - 1, -1, -1):
+                stripped = lines[j].strip()
+                if not stripped:
+                    continue
+                tokens = stripped.lower().split()
+                if tokens and all(t in _ELECTIONWARE_HEADER_TOKENS for t in tokens):
+                    continue
+                contest_name = stripped
+                break
+        elif m_inline:
+            contest_name = m_inline.group(1).strip()
+            vote_for_n = int(m_inline.group(2))
+        else:
             i += 1
             continue
-        vote_for_n = int(m.group(1))
-
-        # Walk backward (over blank lines and column-header lines) to find
-        # the contest header — the most recent non-blank, non-header line.
-        # "Column header" = a line whose tokens are all in the known set
-        # (Election / TOTAL / Day / Mail / Provisional, in any whitespace
-        # arrangement).
-        contest_name = None
-        for j in range(i - 1, -1, -1):
-            stripped = lines[j].strip()
-            if not stripped:
-                continue
-            tokens = stripped.lower().split()
-            if tokens and all(t in _ELECTIONWARE_HEADER_TOKENS for t in tokens):
-                continue
-            contest_name = stripped
-            break
         if not contest_name:
             i += 1
             continue
+        # PDF text extraction sometimes preserves column-aligned spacing
+        # inside the contest header line ("Lower  Merion Township"). Collapse
+        # runs of internal whitespace to a single space so race names group
+        # consistently downstream.
+        contest_name = re.sub(r'\s+', ' ', contest_name).strip()
 
         # Multi-seat: skip the whole contest.
         if vote_for_n > 1:
             i += 1
             continue
 
-        # Scan forward for candidate rows; stop at the next "Vote For N".
+        # Scan forward for candidate rows; stop at the next contest header
+        # (either layout).
         i += 1
         while i < len(lines):
             line = lines[i]
-            if _ELECTIONWARE_VOTE_FOR_RE.match(line):
+            if (_ELECTIONWARE_VOTE_FOR_RE.match(line)
+                or _ELECTIONWARE_INLINE_VF_RE.match(line)):
                 break
-            cand_match = _ELECTIONWARE_CAND_RE.match(line)
+            # Try Montgomery's "Name PARTY ... Total" layout first — if
+            # there's a party code between name and numbers, the row is
+            # Total-column-last. Otherwise fall back to the Berks-style
+            # "Name [PARTY] Total ED Mail Prov" layout (Total first).
+            cand_match = _ELECTIONWARE_CAND_PARTY_RE.match(line)
             if cand_match:
                 name = cand_match.group(1).strip()
                 total = int(cand_match.group(2).replace(',', ''))
@@ -1149,6 +1193,16 @@ def _parse_electionware_lines(lines: list[str]) -> list[dict]:
                     'candidate': name,
                     'votes': total,
                 })
+            else:
+                cand_match = _ELECTIONWARE_CAND_RE.match(line)
+                if cand_match:
+                    name = cand_match.group(1).strip()
+                    total = int(cand_match.group(2).replace(',', ''))
+                    rows.append({
+                        'contest_name': contest_name,
+                        'candidate': name,
+                        'votes': total,
+                    })
             i += 1
     return rows
 
@@ -1979,7 +2033,46 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         coverage_note="Lehigh County (Allentown + boroughs + townships)",
         url=_LEHIGH_PDF_BASE + "Voter/LehighSummaryFirstCert.pdf",
     ),
+    # Montgomery County (Norristown + Philly suburbs). Same Electionware
+    # vendor as Berks/Chester but two layout differences `_parse_electionware_lines`
+    # handles separately:
+    #   1. Contest header has inline "(Vote for N)" instead of a standalone
+    #      "Vote For N" line — matched by _ELECTIONWARE_INLINE_VF_RE.
+    #   2. Candidate rows are "Name PARTY ED Mail Prov TOTAL" instead of
+    #      Berks's "Name TOTAL ED Mail Prov" — matched by the new
+    #      _ELECTIONWARE_CAND_PARTY_RE that takes the LAST number as total.
+    # The 2025 URL is the cumulative summary on the live results webapp;
+    # the "Unofficial" label notwithstanding, it's generated months after
+    # election certification with final tallies.
+    ElectionwarePdfSource(
+        name="2021 Montgomery Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Montgomery County (Norristown + Philly suburbs)",
+        url="https://www.montcopa.org/DocumentCenter/View/31614",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Montgomery Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Montgomery County (Norristown + Philly suburbs)",
+        url="https://www.montcopa.org/DocumentCenter/View/39284",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Montgomery Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Montgomery County (Norristown + Philly suburbs)",
+        url="https://webapp07.montcopa.org/election/"
+            "2025UnofficialPrimaryElectionSummaryReport.pdf",
+    ),
 ]
+
+
+# Bucks County uses an "Election Source" vendor PDF with "Choice Total ED MI PR"
+# columns instead of Electionware's "Name Party ED MI PR Total" layout. Rather
+# than write a second vendor-specific parser for one county, we extract via
+# Claude (LlmPdfSource) — the per-PDF API cost is a few dollars and cached after
+# first run.
+# LLM extraction is unavailable in this environment (no ANTHROPIC_API_KEY).
+# LlmPdfSource still exists for future use but its registry stays empty.
+# Bucks (different "ElectionSource" vendor format) is deferred until we write
+# a dedicated offline parser for that vendor.
+LLM_PDF_SOURCES: list[ElectionSource] = []
 
 
 # Lycoming County (Williamsport + boroughs + townships) uses a different PDF
@@ -2022,6 +2115,12 @@ _PA_STATE_FEDERAL_RACE_EXCLUDE = (
     r"|auditor general|state treasurer"
     r"|senator in the general assembly|representative in the general assembly"
     r"|state senator|state representative"
+    # Ballot questions are not candidate races — they're up/down referendums
+    # with YES/NO choices that our pipeline mistakes for a 2-3 candidate
+    # field. Montgomery 2021 surfaced three of these (Constitutional
+    # Amendments 1/2/3) at 50/50 ties.
+    r"|constitutional amendment|ballot question|referendum"
+    r"|home rule charter"
 )
 
 
@@ -2221,7 +2320,9 @@ if __name__ == "__main__":
     # --- Mid-sized counties: York/Delaware (Clarity), Electionware + Lycoming PDFs ---
     mid_out = "Pennsylvania_NonMajority_MidCounties.xlsx"
     write_workbook_pooled_by_category(
-        CLARITY_PA_SOURCES + ELECTIONWARE_PDF_SOURCES + LYCOMING_PDF_SOURCES, mid_out,
+        CLARITY_PA_SOURCES + ELECTIONWARE_PDF_SOURCES + LYCOMING_PDF_SOURCES
+            + LLM_PDF_SOURCES,
+        mid_out,
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
     print(f"Saved mid-counties workbook to '{mid_out}'")
