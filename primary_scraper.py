@@ -1822,6 +1822,11 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
     # to 2019. Contest names already include the "DEM "/"REP " prefix in the
     # `C` field; the parser leaves them alone.
     ClaritySummaryJsonSource(
+        name="2019 Westmoreland Primary", year=2019, category="Primaries", is_primary=True,
+        coverage_note="Westmoreland County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "Westmoreland/95683/",
+    ),
+    ClaritySummaryJsonSource(
         name="2021 Westmoreland Primary", year=2021, category="Primaries", is_primary=True,
         coverage_note="Westmoreland County (city + boroughs + townships)",
         url=_CLARITY_BASE + "Westmoreland/109366/",
@@ -1839,6 +1844,11 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
     # Luzerne County (Wilkes-Barre / Hazleton). Contest names use a trailing
     # "(DEM)" / "(REP)" parenthetical and CAT="Results" uniformly, so the
     # parser pulls party from the paren before stripping it.
+    ClaritySummaryJsonSource(
+        name="2019 Luzerne Primary", year=2019, category="Primaries", is_primary=True,
+        coverage_note="Luzerne County (Wilkes-Barre + boroughs + townships)",
+        url=_CLARITY_BASE + "Luzerne/95689/",
+    ),
     ClaritySummaryJsonSource(
         name="2021 Luzerne Primary", year=2021, category="Primaries", is_primary=True,
         coverage_note="Luzerne County (Wilkes-Barre + boroughs + townships)",
