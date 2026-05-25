@@ -1859,8 +1859,9 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
         coverage_note="Luzerne County (Wilkes-Barre + boroughs + townships)",
         url=_CLARITY_BASE + "Luzerne/123839/",
     ),
-    # Erie County — Clarity covers 2024+. Pre-2024 results are on the
-    # county website as PDFs (deferred — see ai_research.md §22).
+    # Erie County — Clarity covers 2024+. Pre-2024 primaries are on the
+    # county website as Electionware-format PDFs (parsed by the same
+    # ElectionwarePdfSource — see below).
     ClaritySummaryJsonSource(
         name="2025 Erie Primary", year=2025, category="Primaries", is_primary=True,
         coverage_note="Erie County (city + boroughs + townships)",
@@ -2069,6 +2070,22 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         coverage_note="Montgomery County (Norristown + Philly suburbs)",
         url="https://webapp07.montcopa.org/election/"
             "2025UnofficialPrimaryElectionSummaryReport.pdf",
+    ),
+    # Erie County — pre-Clarity (2021/2023) primaries are hosted as PDFs on
+    # the County Council site. Same Electionware vendor as Montgomery
+    # (Name PARTY ED Mail Prov Total layout + inline "(Vote for N)"). Live
+    # 2024+ primaries come from Clarity (see ClaritySummaryJsonSource above).
+    ElectionwarePdfSource(
+        name="2021 Erie Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Erie County (city + boroughs + townships)",
+        url="https://www.eriecountycouncilpa.gov/uploads/modules/resources/"
+            "520965_erie_county_2021_municipal_primary_official_results.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Erie Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Erie County (city + boroughs + townships)",
+        url="https://www.eriecountycouncilpa.gov/uploads/modules/resources/"
+            "688208_erie_county_2023_municipal_primary_official_results.pdf",
     ),
 ]
 

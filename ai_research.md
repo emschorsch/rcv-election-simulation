@@ -67,7 +67,7 @@ We made these choices in roughly the order shown above. The progression was:
 | `Pennsylvania_NonMajority_2018plus.xlsx` | OpenElections | Two pooled sheets (Primaries, Generals) | PA federal + state, 2018–2024 |
 | `Allegheny_NonMajority_Local.xlsx` | WPRDC | Two pooled sheets (Primaries, Generals) | Allegheny County local races, 2017–2025 |
 | `Pennsylvania_NonMajority_Local2025.xlsx` | OpenElections `2025/counties/` | One pooled sheet (Generals) | All 67 PA counties local races, 2025 only |
-| `Pennsylvania_NonMajority_MidCounties.xlsx` | Clarity (York/Delaware) + Electionware PDF (Berks + 9 more) + Lycoming PDF | Two pooled sheets (Primaries, Generals) | York/Delaware 2023+; Electionware-format PDF for 10 PA counties 2021–2025; Lycoming 2021–2025 |
+| `Pennsylvania_NonMajority_MidCounties.xlsx` | Clarity (York / Delaware / Westmoreland / Luzerne / Erie) + Electionware PDF (Berks, Chester, Lehigh, Lebanon, Mercer, Northampton, Northumberland, Schuylkill, Indiana, Centre, Montgomery, Erie 2021/2023) + Lycoming PDF | Two pooled sheets (Primaries, Generals) | 16 PA counties' primaries across 2019–2025 plus Lycoming 2021–2025 |
 | `Top_RCV_Races.xlsx` | derived from the five workbooks above | Four sheets: closest two-way, crowded fields, notable local offices, all non-majority | One row per race; sorted to put the most RCV-relevant cases first |
 
 The workbooks are checked into the repo so anyone can read the findings without re-running the pipeline. Regeneration (`python primary_scraper.py`) overwrites them in place.
@@ -248,6 +248,32 @@ After the audit landed at 142 verified-clean races, the curation goal shifted fr
 2. Require at least 3 distinct candidates above the 1% per-candidate threshold. Two-candidate non-majority races (which only occur when total ballots include write-ins or undervotes) aren't IRV cases — RCV can't change the winner with only two choices on the ballot.
 
 Implemented as `filter_rcv_useful_races(df, min_candidates=3)`. Drops 142 → 133 races. The 9 dropped were all 2-candidate (including all 7 exact 50/50 ties): East Deer Ward 2, Ross Ward 8, Berks Brecknock Twp / Rockland Twp (winner-by-draw), Susquenita School District III, Huntingdon Auditor Springfield, plus the Allegheny duplicate of East Deer and Sunbury Council. Closest 3-way race surviving: 2025 Lancaster Supervisor West Lampeter (Hershey 33.58 / Arnold 33.54 / 3rd ≈32.9, gap 0.04%).
+
+### 21. County expansion (Clarity + Montgomery + Erie + older years)
+
+After the curation pass landed at 133 races, the next sweep widened coverage. Three phases:
+
+* **Phase 1 — five Clarity counties** (Westmoreland 2021/2023/2025, Luzerne 2021/2025, Erie 2025). Each uses a slightly different Clarity contest-name convention; the parser had to learn three new variants:
+  * Westmoreland: contest name already prefixed `"DEM "` / `"REP "` — leave it alone.
+  * Luzerne: `CAT="Results"` uniformly, trailing `(DEM)` / `(REP)` paren — capture the party from the paren so the no-filed-candidate filter still works.
+  * Erie: long-form `(DEMOCRATIC)` / `(REPUBLICAN)` paren — extended `_CLARITY_PARTY_PAREN_RE` to match either short or long form and added `_CLARITY_PARTY_WORD_TO_CODE` mapping.
+
+* **Phase 2 — Montgomery County** via offline `ElectionwarePdfSource`. Two layout differences from Berks/Chester:
+  1. Inline `(Vote for N)` in the contest header instead of a standalone `Vote For N` line — `_ELECTIONWARE_INLINE_VF_RE`.
+  2. Candidate rows have a party code between name and numbers, with the Total column LAST instead of FIRST — `_ELECTIONWARE_CAND_PARTY_RE` that takes the last number as Total. The existing Name-Total-First pattern is tried as a fallback so all existing counties still parse.
+
+  Same commit also: filtered `"Total Votes"` (Montgomery's per-contest total row label, distinct from Chester's `"Total Votes Cast"`); collapsed runs of internal whitespace in contest names (PDF text extraction preserved column-aligned spacing like `"Lower  Merion Township"`); excluded Constitutional Amendments / referendums / home-rule charter ballot questions (Montgomery 2021 surfaced three as fake 50/50 ties).
+
+* **Phase 3 — older years** for existing Clarity counties (Westmoreland 2019, Luzerne 2019) and pre-Clarity Erie (2021/2023 primary PDFs from `eriecountycouncilpa.gov` — same Electionware vendor with Montgomery-style layout, parsed by the existing source after Phase 2's parser changes).
+
+End-of-session counts: 133 → 164 non-majority races (+15 from Phase 1, +2 from Phase 2 + cleanup, +9 from Phase 3a, +5 from Phase 3b). Notable new findings:
+
+* 2019 Hazleton City Mayor (Luzerne): Cusat 35.94% in a 5-way primary.
+* 2021 Erie County Executive (Dem): Titus 32.17% over Vogel 31.37% in a 4-way race — 0.8% top-2 gap, classic RCV case.
+* 2019 Westmoreland Sheriff: Albert 47.76% in a 5-way primary.
+* 2019 Wilkes-Barre City Controller (Dem): Snyder 41.84%, 3 cands.
+
+**Bucks County and pre-2019 Clarity years remain out of scope.** Bucks uses an "ElectionSource"-vendor PDF (`Choice Total ED MI PR` columns, single-space separator, no party code on candidate rows) that would need a dedicated offline parser — `LlmPdfSource` was the obvious shortcut but isn't viable in this environment (no `ANTHROPIC_API_KEY`). Pre-2019 Clarity URLs serve HTML only (no `summary.json`), so they'd require an HTML scraper. `LLM_PDF_SOURCES` registry is wired up but intentionally empty per [[no-anthropic-api-key]].
 
 ## Filtering thresholds and rationale
 
