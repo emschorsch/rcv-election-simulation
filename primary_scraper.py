@@ -2203,6 +2203,33 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         url="https://cms.washingtoncopa.gov/uploads/"
             "2025_Municipal_Primary_Election_Summary_Official_4424b742e7.pdf",
     ),
+    # Lackawanna County (Scranton + Carbondale + townships) — same vendor as
+    # Chester (Electionware with the optional VOTE % column). PDFs hosted on
+    # cms8.revize.com under the county subpath. 2021 primary URL not yet
+    # discovered.
+    ElectionwarePdfSource(
+        name="2023 Lackawanna Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Lackawanna County (Scranton + Carbondale + townships)",
+        url="https://cms8.revize.com/revize/lackawanna/LackawannaPrimary2023Summary.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Lackawanna Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Lackawanna County (Scranton + Carbondale + townships)",
+        url="https://cms8.revize.com/revize/lackawanna/Document_center/"
+            "Certified%20Election%20Results/2025/25SUM.CERT.pdf",
+    ),
+    # Butler County (suburban Pittsburgh / Slippery Rock) — Berks-style
+    # Electionware format.
+    ElectionwarePdfSource(
+        name="2023 Butler Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Butler County (Butler City + boroughs + townships)",
+        url="https://www.butlercountypa.gov/DocumentCenter/View/6915/SUMMARY-PDF",
+    ),
+    ElectionwarePdfSource(
+        name="2025 Butler Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Butler County (Butler City + boroughs + townships)",
+        url="https://butlercountypa.gov/DocumentCenter/View/10551/SUMMARY-PDF",
+    ),
 ]
 
 
