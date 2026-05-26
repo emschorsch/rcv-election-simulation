@@ -2152,6 +2152,14 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
         coverage_note="Cambria County (Johnstown + boroughs + townships)",
         url=_CLARITY_BASE + "Cambria/119020/",
     ),
+    # Fayette County (Uniontown + southwestern PA). 2025 primary is on
+    # Clarity (Luzerne-style trailing party paren); pre-2025 primaries
+    # are Electionware PDFs on the county DocumentCenter.
+    ClaritySummaryJsonSource(
+        name="2025 Fayette Primary", year=2025, category="Primaries", is_primary=True,
+        coverage_note="Fayette County (Uniontown + boroughs + townships)",
+        url=_CLARITY_BASE + "Fayette/123836/",
+    ),
 ]
 
 
@@ -2431,6 +2439,18 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         name="2025 Butler Primary", year=2025, category="Primaries", is_primary=True,
         coverage_note="Butler County (Butler City + boroughs + townships)",
         url="https://butlercountypa.gov/DocumentCenter/View/10551/SUMMARY-PDF",
+    ),
+    # Fayette County PDFs (pre-2025 primaries). Electionware format with
+    # inline "(Vote for N)" headers, like Montgomery and Erie.
+    ElectionwarePdfSource(
+        name="2021 Fayette Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Fayette County (Uniontown + boroughs + townships)",
+        url="https://www.fayettecountypa.org/DocumentCenter/View/9115",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Fayette Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Fayette County (Uniontown + boroughs + townships)",
+        url="https://www.fayettecountypa.org/DocumentCenter/View/6591",
     ),
 ]
 
