@@ -2133,6 +2133,25 @@ CLARITY_PA_SOURCES: list[ElectionSource] = [
         coverage_note="Cambria County (Johnstown + boroughs + townships)",
         url=_CLARITY_BASE + "Cambria/123841/",
     ),
+    # --- General elections for the Clarity counties. Odd-year generals
+    # (2021, 2023) are valuable because OpenElections doesn't cover those
+    # years for PA — these are the only place local mayor/council/sup-
+    # ervisor head-to-head races surface.
+    ClaritySummaryJsonSource(
+        name="2021 Westmoreland General", year=2021, category="Generals",
+        coverage_note="Westmoreland County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "Westmoreland/111510/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2023 Westmoreland General", year=2023, category="Generals",
+        coverage_note="Westmoreland County (city + boroughs + townships)",
+        url=_CLARITY_BASE + "Westmoreland/119030/",
+    ),
+    ClaritySummaryJsonSource(
+        name="2023 Cambria General", year=2023, category="Generals",
+        coverage_note="Cambria County (Johnstown + boroughs + townships)",
+        url=_CLARITY_BASE + "Cambria/119020/",
+    ),
 ]
 
 
@@ -2352,6 +2371,18 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
         coverage_note="Erie County (city + boroughs + townships)",
         url="https://www.eriecountycouncilpa.gov/uploads/modules/resources/"
             "688208_erie_county_2023_municipal_primary_official_results.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2021 Erie General", year=2021, category="Generals", is_primary=False,
+        coverage_note="Erie County (city + boroughs + townships)",
+        url="https://www.eriecountycouncilpa.gov/uploads/modules/resources/"
+            "520895_erie_county_2021_municipal_election_official_results.pdf",
+    ),
+    ElectionwarePdfSource(
+        name="2023 Erie General", year=2023, category="Generals", is_primary=False,
+        coverage_note="Erie County (city + boroughs + townships)",
+        url="https://www.eriecountycouncilpa.gov/uploads/modules/resources/"
+            "634675_erie_county_2023_municipal_election_official_results.pdf",
     ),
     # Washington County (suburban Pittsburgh) — Berks-style Electionware
     # layout (Name-Total-First, separate "Vote For N" line, party prefix
