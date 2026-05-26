@@ -1373,6 +1373,52 @@ def test_clarity_extracts_party_from_trailing_paren_when_cat_is_generic():
     assert 'DEM District Attorney' not in set(out['Race_Name'])
 
 
+def test_lancaster_parser_extracts_contest_vote_for_and_candidates():
+    from primary_scraper import _parse_lancaster_race_page
+    html = """
+    <html><body>
+      <td align='center' colspan='3' style='font-weight:bold'>SHERIFF</td>
+      <td>2 Candidates</td><td align='right'>Vote for not more than one</td>
+      <table border='1'>
+        <tr>
+          <td>JANE DOE</td>
+          <td align='right'>1,200</td>
+          <td align='right'>500</td>
+          <td align='right'>10</td>
+          <td align='right'>1,710</td>
+        </tr>
+        <tr>
+          <td>JOHN ROE</td>
+          <td align='right'>900</td>
+          <td align='right'>400</td>
+          <td align='right'>5</td>
+          <td align='right'>1,305</td>
+        </tr>
+      </table>
+    </body></html>
+    """
+    contest, vf, rows = _parse_lancaster_race_page(html)
+    assert contest == "SHERIFF"
+    assert vf == 1
+    assert rows == [("JANE DOE", 1710), ("JOHN ROE", 1305)]
+
+
+def test_lancaster_parser_skips_multi_seat_via_word_number():
+    # "Vote for not more than three" -> N=3, caller should drop.
+    from primary_scraper import _parse_lancaster_race_page
+    html = """
+      <td align='center' style='font-weight:bold'>COURT OF COMMON PLEAS</td>
+      <td align='right'>Vote for not more than three</td>
+      <table border='1'>
+        <tr><td>A</td><td align='right'>1</td><td align='right'>1</td>
+            <td align='right'>1</td><td align='right'>3</td></tr>
+      </table>
+    """
+    contest, vf, rows = _parse_lancaster_race_page(html)
+    assert contest == "COURT OF COMMON PLEAS"
+    assert vf == 3
+
+
 def test_bucks_parser_total_first_with_party_in_header():
     # Bucks's "ElectionSource"-vendor layout: party encoded in contest header
     # only; candidate rows are "Name Total ED MI PR" with single-space sep.

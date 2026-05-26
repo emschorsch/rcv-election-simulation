@@ -1419,6 +1419,177 @@ class BucksPdfSource(ElectionSource):
         return _rows_to_tidy(rows, is_primary=self.is_primary)
 
 
+# Lancaster County publishes 2021/2023 (and earlier) election results as a
+# hierarchical HTML site: a SelectParty page → per-party CatX index pages
+# (CatC = countywide, CatJ = judiciary, CatS = schools, CatL = Lancaster
+# City, CatB = boroughs, CatT = townships, CatP = statewide) → individual
+# race-result pages with vote-count tables. The leaf pages have a stable
+# layout — bold contest name, "Vote for not more than N" indicator, and
+# a 5-column table (Candidate / Election Day / Mail In / Provisional /
+# Total). The TOTAL column is the LAST per row.
+#
+# 2025+ results moved to a JavaScript SPA whose CDN-hosted PDFs aren't
+# downloadable without an in-browser session; that year is deferred.
+
+_LANC_RACE_LINK_RE = re.compile(r"href='([^']*/(\d+)\.html)'", re.IGNORECASE)
+_LANC_CONTEST_RE = re.compile(
+    r"<td[^>]*font-weight:\s*bold[^>]*>([^<]+)</td>", re.IGNORECASE,
+)
+_LANC_VOTE_FOR_RE = re.compile(
+    r"Vote\s+for\s+not\s+more\s+than\s+(\w+)", re.IGNORECASE,
+)
+# Candidate row in the bordered table: 5 cells (name + 4 vote totals).
+# The name <td> may contain an <a> tag for write-in / by-precinct links.
+_LANC_ROW_RE = re.compile(
+    r"<tr>\s*"
+    r"<td[^>]*>(?:<[^>]+>)?\s*([^<]+?)\s*(?:</[^>]+>)?\s*</td>\s*"
+    r"<td[^>]*align='right'[^>]*>([\d,]+)</td>\s*"
+    r"<td[^>]*align='right'[^>]*>([\d,]+)</td>\s*"
+    r"<td[^>]*align='right'[^>]*>([\d,]+)</td>\s*"
+    r"<td[^>]*align='right'[^>]*>([\d,]+)</td>\s*"
+    r"</tr>",
+    re.IGNORECASE | re.DOTALL,
+)
+_NUMBER_WORDS = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6,
+    'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+}
+
+
+def _parse_lancaster_race_page(html: str) -> tuple[Optional[str], int, list[tuple[str, int]]]:
+    """Parse one Lancaster race-result HTML page into (contest_name, vote_for_n, [(candidate, votes), ...]).
+
+    Returns (None, 0, []) if the page isn't a race-result page (e.g. category
+    index pages have no bold contest header). Multi-seat races still return
+    their data; the caller is responsible for skipping them.
+    """
+    cm = _LANC_CONTEST_RE.search(html)
+    if not cm:
+        return None, 0, []
+    contest = cm.group(1).strip()
+    vote_for_n = 1
+    vm = _LANC_VOTE_FOR_RE.search(html)
+    if vm:
+        raw = vm.group(1).lower()
+        try:
+            vote_for_n = int(raw)
+        except ValueError:
+            vote_for_n = _NUMBER_WORDS.get(raw, 1)
+    rows: list[tuple[str, int]] = []
+    for rm in _LANC_ROW_RE.finditer(html):
+        name = rm.group(1).strip()
+        total = int(rm.group(5).replace(',', ''))
+        rows.append((name, total))
+    return contest, vote_for_n, rows
+
+
+def _walk_lancaster_year(year_path: str, *, max_workers: int = 8) -> list[dict]:
+    """Walk Lancaster's per-party CatX index pages and return raw result rows.
+
+    `year_path` is the URL segment that identifies the election, e.g.
+    "May_16,_2023_-_Municipal_Primary". We visit each party's index pages
+    (DEMCategories.html, etc.), follow the links to per-category index
+    pages, then to individual race pages, and parse each. Multi-seat
+    contests are skipped. Write-in detail pages and by-precinct pages
+    have URLs with letters after the number (e.g. "11WriteIn.html") and
+    are filtered out by the integer-only race-id regex.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    base = f"https://vr.co.lancaster.pa.us/ElectionReturns/{year_path}/"
+    # Walk index pages serially (small fan-out) then race pages in parallel.
+
+    def fetch(url: str) -> str:
+        req = urllib.request.Request(url, headers={'User-Agent': 'rcv-finder'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode('utf-8', errors='ignore')
+
+    parties = [('DEM', 'DEM'), ('REP', 'REP'), ('NON', '')]
+    cats = ['C', 'J', 'S', 'L', 'B', 'T']  # skip 'P' = statewide (already covered)
+    # Boroughs / Townships / Schools have a second level: each
+    # municipality has its own sub-index page (e.g. "DEMCatBADAMSTOWN.html")
+    # before the race-result pages. Detect those by a "<letter>Cat<c>{NAME}.html"
+    # link in the category index, fetch each, then collect race-page links.
+    race_urls: list[tuple[str, str]] = []  # (party_prefix, race_url)
+    seen: set[str] = set()
+    for letter, prefix in parties:
+        try:
+            cat_index_html = fetch(f"{base}{letter}Categories.html")
+        except urllib.error.HTTPError:
+            continue
+        for c in cats:
+            top_cat_re = re.compile(
+                r"href='[^']*/" + letter + "Cat" + c + r"\.html'", re.IGNORECASE,
+            )
+            if not top_cat_re.search(cat_index_html):
+                continue
+            queue = [f"{base}{letter}Cat{c}.html"]
+            visited_idx: set[str] = set()
+            while queue:
+                idx_url = queue.pop()
+                if idx_url in visited_idx:
+                    continue
+                visited_idx.add(idx_url)
+                try:
+                    idx_html = fetch(idx_url)
+                except urllib.error.HTTPError:
+                    continue
+                # Sub-category pages (e.g. DEMCatBADAMSTOWN.html) link to
+                # additional sub-indices — queue them for traversal.
+                sub_cat_re = re.compile(
+                    r"href='([^']*/" + letter + "Cat" + c + r"[A-Z0-9_]+\.html)'",
+                    re.IGNORECASE,
+                )
+                for sm in sub_cat_re.finditer(idx_html):
+                    queue.append(sm.group(1))
+                # Numeric race-page links.
+                for m in _LANC_RACE_LINK_RE.finditer(idx_html):
+                    race_url = m.group(1)
+                    if race_url in seen:
+                        continue
+                    seen.add(race_url)
+                    race_urls.append((prefix, race_url))
+
+    print(f"  walking {len(race_urls)} Lancaster race pages...")
+    rows: list[dict] = []
+
+    def parse_one(item):
+        prefix, url = item
+        try:
+            html = fetch(url)
+        except urllib.error.HTTPError:
+            return []
+        contest, vote_for_n, cand_rows = _parse_lancaster_race_page(html)
+        if not contest or vote_for_n > 1:
+            return []
+        contest_name = f"{prefix} {contest}".strip()
+        return [{'contest_name': contest_name, 'candidate': n, 'votes': v}
+                for n, v in cand_rows]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for batch in ex.map(parse_one, race_urls):
+            rows.extend(batch)
+    return rows
+
+
+@dataclass(kw_only=True)
+class LancasterHtmlSource(ElectionSource):
+    """Scrape Lancaster County's hierarchical HTML election-returns site.
+
+    Walks the per-party CatX index pages (Countywide, Judiciary, Schools,
+    City, Boroughs, Townships) and parses each leaf race page. 2025+
+    results moved to a JS-rendered SPA and aren't accessible this way —
+    only 2019/2021/2023 (and earlier) elections work.
+    """
+    year_path: str = ""  # e.g. "May_16,_2023_-_Municipal_Primary"
+    is_primary: bool = False
+
+    def fetch_tidy(self) -> pd.DataFrame:
+        print(f"  scraping Lancaster HTML site ({self.year_path})...")
+        rows = _walk_lancaster_year(self.year_path)
+        return _rows_to_tidy(rows, is_primary=self.is_primary)
+
+
 # --- Pipeline ---------------------------------------------------------------
 
 def add_percentages(df: pd.DataFrame) -> pd.DataFrame:
@@ -2266,6 +2437,28 @@ BUCKS_PDF_SOURCES: list[ElectionSource] = [
 ]
 
 
+# Lancaster County (570K, 7th-largest PA county) publishes pre-2025
+# results as a hierarchical HTML site on vr.co.lancaster.pa.us. Walked
+# by LancasterHtmlSource. 2025+ moved to a JS-rendered SPA whose PDF
+# downloads require an in-browser session — deferred.
+LANCASTER_HTML_SOURCES: list[ElectionSource] = [
+    LancasterHtmlSource(
+        name="2021 Lancaster Primary", year=2021, category="Primaries", is_primary=True,
+        coverage_note="Lancaster County (Lancaster City + boroughs + townships)",
+        year_path="May_18,_2021_-_Municipal_Primary",
+        url="https://vr.co.lancaster.pa.us/ElectionReturns/"
+            "May_18,_2021_-_Municipal_Primary/SelectParty.html",
+    ),
+    LancasterHtmlSource(
+        name="2023 Lancaster Primary", year=2023, category="Primaries", is_primary=True,
+        coverage_note="Lancaster County (Lancaster City + boroughs + townships)",
+        year_path="May_16,_2023_-_Municipal_Primary",
+        url="https://vr.co.lancaster.pa.us/ElectionReturns/"
+            "May_16,_2023_-_Municipal_Primary/SelectParty.html",
+    ),
+]
+
+
 # Lycoming County (Williamsport + boroughs + townships) uses a different PDF
 # vendor — inline contest headers with party in parens, plus a VOTE % column.
 # Parsed by `LycomingPdfSource`.
@@ -2512,7 +2705,7 @@ if __name__ == "__main__":
     mid_out = "Pennsylvania_NonMajority_MidCounties.xlsx"
     write_workbook_pooled_by_category(
         CLARITY_PA_SOURCES + ELECTIONWARE_PDF_SOURCES + LYCOMING_PDF_SOURCES
-            + BUCKS_PDF_SOURCES + LLM_PDF_SOURCES,
+            + BUCKS_PDF_SOURCES + LANCASTER_HTML_SOURCES + LLM_PDF_SOURCES,
         mid_out,
         race_exclude_pattern=_PA_STATE_FEDERAL_RACE_EXCLUDE,
     )
