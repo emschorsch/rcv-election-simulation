@@ -2474,6 +2474,20 @@ BUCKS_PDF_SOURCES: list[ElectionSource] = [
 # downloads require an in-browser session — deferred.
 LANCASTER_HTML_SOURCES: list[ElectionSource] = [
     LancasterHtmlSource(
+        name="2017 Lancaster Primary", year=2017, category="Primaries", is_primary=True,
+        coverage_note="Lancaster County (Lancaster City + boroughs + townships)",
+        year_path="May_16,_2017_-_Municipal_Primary",
+        url="https://vr.co.lancaster.pa.us/ElectionReturns/"
+            "May_16,_2017_-_Municipal_Primary/SelectParty.html",
+    ),
+    LancasterHtmlSource(
+        name="2019 Lancaster Primary", year=2019, category="Primaries", is_primary=True,
+        coverage_note="Lancaster County (Lancaster City + boroughs + townships)",
+        year_path="May_21,_2019_-_Municipal_Primary",
+        url="https://vr.co.lancaster.pa.us/ElectionReturns/"
+            "May_21,_2019_-_Municipal_Primary/SelectParty.html",
+    ),
+    LancasterHtmlSource(
         name="2021 Lancaster Primary", year=2021, category="Primaries", is_primary=True,
         coverage_note="Lancaster County (Lancaster City + boroughs + townships)",
         year_path="May_18,_2021_-_Municipal_Primary",
