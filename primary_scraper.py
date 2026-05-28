@@ -1226,8 +1226,23 @@ def _pdf_url_to_lines(pdf_url: str) -> list[str]:
         req = urllib.request.Request(
             pdf_url, headers={'User-Agent': 'rcv-finder'}
         )
-        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
-            tmp.write(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+                tmp.write(resp.read())
+        except urllib.error.URLError as e:
+            # Some county servers (e.g. lehighcounty.org as of mid-2026)
+            # omit the intermediate cert from their TLS chain, so neither
+            # certifi nor the macOS system store can verify them — `curl`
+            # works because of its caching of intermediates from prior
+            # connections. Public election PDFs aren't credentialed, so
+            # fall back to an unverified SSL context with a warning.
+            if not (isinstance(e.reason, ssl.SSLCertVerificationError)):
+                raise
+            print(f"  WARNING: cert verification failed for {pdf_url}; "
+                  f"retrying with unverified SSL context")
+            unverified = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=60, context=unverified) as resp:
+                tmp.write(resp.read())
         tmp_path = tmp.name
 
     all_lines: list[str] = []
@@ -1403,6 +1418,169 @@ def _parse_bucks_pdf_lines(lines: list[str]) -> list[dict]:
                 'votes': total,
             })
     return rows
+
+
+# Lehigh County's pre-2021 primary PDFs use a custom Election-Source-like
+# layout that doesn't match Electionware or the modern Bucks parser:
+#
+#   <Jurisdiction>             e.g. "CITY OF ALLENTOWN"
+#   <Office>                   e.g. "MAYOR"
+#   (Vote for One - 4 Year Term)
+#   <PARTY> <Name> <ED> Ballot <Mail> <Prov> <Other> <Total>
+#   <PARTY> <Name> <WriteIn-tot> Write-In <Total>
+#
+# The contest header spans 1-2 lines preceding the "(Vote for X)" line.
+# "Vote for One/Two/Three/..." uses a word in place of a digit. Multi-
+# seat contests are skipped at the caller.
+_LEHIGH_OLD_VOTE_FOR_RE = re.compile(
+    r"\(Vote for\s+(?:not more than\s+)?(\w+)", re.IGNORECASE,
+)
+_LEHIGH_OLD_CAND_RE = re.compile(
+    r"^\s*(" + _PARTY_CODE_GROUP + r")\s+([A-Z][^0-9]*?)\s+"
+    r"(\d[\d,]*)\s+Ballot\s+(\d[\d,]*)\s+(\d[\d,]*)\s+(\d[\d,]*)\s+(\d[\d,]*)\s*$"
+)
+_LEHIGH_OLD_WRITEIN_RE = re.compile(
+    r"^\s*(" + _PARTY_CODE_GROUP + r")\s+([A-Z][^0-9]*?)\s+"
+    r"(\d[\d,]*)\s+Write-In(?:\s+\d[\d,]*){0,3}\s+(\d[\d,]*)\s*$"
+)
+# "Empty" candidate rows — placeholder lines like "DEM     0 Ballot 0 0 0 0"
+# that appear when no candidate filed for that party. They aren't real
+# candidates and don't match _LEHIGH_OLD_CAND_RE (which requires a name);
+# we recognize them here so the state machine doesn't mistake them for
+# jurisdiction headers.
+_LEHIGH_OLD_EMPTY_CAND_RE = re.compile(
+    r"^\s*(" + _PARTY_CODE_GROUP + r")\s+\d", re.IGNORECASE,
+)
+# Section-divider lines that group contests by category (e.g. "BOROUGHS"
+# divides borough contests from township ones). These are NOT jurisdictions
+# — the actual borough/township name appears on the line right after, and
+# subsequent contests inherit that jurisdiction until the next divider.
+_LEHIGH_OLD_SECTION_HEADERS = frozenset({
+    'BOROUGHS', 'TOWNSHIPS', 'WARDS', 'MAGISTERIAL DISTRICTS',
+    'COUNTY WIDE', 'COUNTYWIDE', 'DISTRICT WIDE', 'JUDICIAL OFFICES',
+})
+
+
+def _parse_lehigh_old_pdf_lines(lines: list[str]) -> list[dict]:
+    """Parse Lehigh's pre-2021 primary PDF format into raw result rows.
+
+    The file groups contests by municipality:
+
+        CITY OF ALLENTOWN          (jurisdiction)
+        MAYOR                      (office)
+        (Vote for One - 4 Year Term)
+        ... candidates ...
+        CITY COUNCIL               (office; same jurisdiction inherited)
+        (Vote for ...)
+        ...
+        BOROUGHS                   (section divider)
+        ALBURTIS                   (new jurisdiction)
+        MAYOR                      (office)
+        (Vote for ...)
+        ...
+
+    Anchors on each "(Vote for X)" line; takes the immediately-preceding
+    non-blank line as the office. The line BEFORE that is either:
+      (a) a candidate row from a previous contest in the same jurisdiction
+          — keep the tracked jurisdiction, OR
+      (b) a new jurisdiction header — update the tracked jurisdiction.
+    Section dividers like "BOROUGHS" are skipped explicitly.
+
+    Multi-seat contests (N>1) are dropped. Both "PARTY Name X Ballot ED
+    Mail Prov Total" and the shorter "PARTY Name X Write-In Total" rows
+    are recognized.
+    """
+    rows: list[dict] = []
+    current_jurisdiction = ""
+    i = 0
+    while i < len(lines):
+        m = _LEHIGH_OLD_VOTE_FOR_RE.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        raw = m.group(1).lower()
+        try:
+            vote_for_n = int(raw)
+        except ValueError:
+            vote_for_n = _NUMBER_WORDS.get(raw, 1)
+
+        # Walk back: most recent non-blank line is the office.
+        j = i - 1
+        while j >= 0 and not lines[j].strip():
+            j -= 1
+        if j < 0:
+            i += 1
+            continue
+        office = lines[j].strip()
+        # Sanity: a candidate row would be misidentified as office; bail.
+        if (_LEHIGH_OLD_CAND_RE.match(lines[j])
+            or _LEHIGH_OLD_WRITEIN_RE.match(lines[j])):
+            i += 1
+            continue
+
+        # Walk back further: the line above the office is either a new
+        # jurisdiction header (if this is the first contest in a new
+        # municipality) or a candidate row from the previous contest
+        # (in which case we keep the inherited jurisdiction).
+        k = j - 1
+        while k >= 0 and not lines[k].strip():
+            k -= 1
+        if k >= 0:
+            above = lines[k].strip()
+            is_candidate_row = (
+                _LEHIGH_OLD_CAND_RE.match(lines[k])
+                or _LEHIGH_OLD_WRITEIN_RE.match(lines[k])
+                or _LEHIGH_OLD_EMPTY_CAND_RE.match(lines[k])
+            )
+            if (not is_candidate_row
+                and above.upper() not in _LEHIGH_OLD_SECTION_HEADERS):
+                current_jurisdiction = above
+
+        if vote_for_n > 1 or not office:
+            i += 1
+            continue
+
+        contest_office = (f"{current_jurisdiction} {office}"
+                          if current_jurisdiction else office)
+
+        # Walk forward, collect candidate rows.
+        i += 1
+        while i < len(lines):
+            line = lines[i]
+            if _LEHIGH_OLD_VOTE_FOR_RE.search(line):
+                break
+            cm = _LEHIGH_OLD_CAND_RE.match(line)
+            if cm:
+                rows.append({
+                    'contest_name': f"{cm.group(1)} {contest_office}",
+                    'candidate': cm.group(2).strip(),
+                    'votes': int(cm.group(7).replace(',', '')),
+                })
+            else:
+                wm = _LEHIGH_OLD_WRITEIN_RE.match(line)
+                if wm:
+                    rows.append({
+                        'contest_name': f"{wm.group(1)} {contest_office}",
+                        'candidate': wm.group(2).strip(),
+                        'votes': int(wm.group(4).replace(',', '')),
+                    })
+            i += 1
+    return rows
+
+
+@dataclass(kw_only=True)
+class LehighOldPdfSource(ElectionSource):
+    """Extract pre-2021 Lehigh County primary results from their custom PDF
+    layout ("CITY OF ALLENTOWN / MAYOR / (Vote for One) / PARTY Name X
+    Ballot ED Mail Prov Total" rows). Used specifically to capture the
+    canonical 2017 Allentown DEM mayoral primary (Pawlowski 28.4% in a
+    7-way contest that motivated Allentown's later RCV interest)."""
+    is_primary: bool = True
+
+    def fetch_tidy(self) -> pd.DataFrame:
+        print(f"  extracting Lehigh-old PDF via pdfplumber...")
+        rows = _parse_lehigh_old_pdf_lines(_pdf_url_to_lines(self.url))
+        return _rows_to_tidy(rows, is_primary=self.is_primary)
 
 
 @dataclass(kw_only=True)
@@ -1883,6 +2061,20 @@ PHILLY_PRIMARY_SOURCES: list[ElectionSource] = [
         votes_col="TOTAL",
         party_col="PARTY",
     ),
+    # 2017 — Larry Krasner's 7-way DEM District Attorney primary, also
+    # Rebecca Rhynhart's challenge to incumbent City Controller Butkovitz.
+    # The XLSX has three sheets; the "Precinct-level Data" sheet is the
+    # long-format one. OFFICE column already includes the party suffix
+    # ("DISTRICT ATTORNEY-DEM"), so party_col stays unset.
+    LongCategorySelectionExcelSource(
+        name="2017",
+        url="https://files7.philadelphiavotes.com/election-results/"
+            "2017_PRIMARY/2017_PRIMARY_-_RESULTS_.xlsx",
+        sheet_name="Precinct-level Data",
+        category_col="OFFICE",
+        selection_col="CANDIDATE",
+        votes_col="VOTES",
+    ),
     LongCategorySelectionExcelSource(
         name="2019",
         url="https://vote.phila.gov/files/election-results/2019_PRIMARY/2019_PRIMARY_RESULTS_BY_TYPE_BY_PRECINCT.xlsx",
@@ -2327,6 +2519,15 @@ ELECTIONWARE_PDF_SOURCES: list[ElectionSource] = [
     # is the canonical PA RCV case — Tuerk won the 6-way DEM Allentown
     # mayoral by 122 votes over the incumbent. 2023 is live-portal only
     # on Lehigh's site (no direct PDF).
+    # 2017 — the canonical pre-Tuerk Allentown DEM mayoral primary, where
+    # then-incumbent Ed Pawlowski (under federal indictment) won an 8-way
+    # race with 28.4% to challenger Ray O'Connell's 23.0%. Different PDF
+    # vendor format than 2021+ Lehigh; parsed by LehighOldPdfSource.
+    LehighOldPdfSource(
+        name="2017 Lehigh Primary", year=2017, category="Primaries", is_primary=True,
+        coverage_note="Lehigh County (Allentown + boroughs + townships)",
+        url=_LEHIGH_PDF_BASE + "Voter/2017MPTotals.pdf",
+    ),
     ElectionwarePdfSource(
         name="2021 Lehigh Primary", year=2021, category="Primaries", is_primary=True,
         coverage_note="Lehigh County (Allentown + boroughs + townships)",
