@@ -2930,13 +2930,17 @@ def make_top_races_workbook(
 
 if __name__ == "__main__":
     # --- Philly primaries ---
-    include_all = False  # True -> all non-majority races; False -> mayor/council only
+    # Include Mayor + District Council (the original RCV-relevant offices)
+    # plus District Attorney and Controller (citywide single-winner races
+    # that also surface in non-mayoral years — 2017 was the open-seat
+    # DA primary that Larry Krasner won 38.2% in a 7-way race).
+    include_all = False  # True -> all non-majority races; False -> the curated set
     if include_all:
         philly_out = "Philadelphia_Primary_AllRaces.xlsx"
         philly_race_pattern = None
     else:
         philly_out = "Philadelphia_Primary_Mayor_DistrictCouncil.xlsx"
-        philly_race_pattern = r"mayor|district council"
+        philly_race_pattern = r"mayor|district council|district attorney|controller"
     write_workbook(PHILLY_PRIMARY_SOURCES, philly_out, race_pattern=philly_race_pattern)
     print(f"Saved Philly workbook to '{philly_out}'")
 
